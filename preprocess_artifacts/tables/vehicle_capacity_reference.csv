@@ -1,0 +1,6 @@
+﻿vehicle_type,power_type,capacity_kg,capacity_m3,vehicle_count
+fuel_3000,fuel,3000,13.5,60
+fuel_1500,fuel,1500,10.8,50
+fuel_1250,fuel,1250,6.5,50
+ev_3000,ev,3000,15.0,10
+ev_1250,ev,1250,8.5,15

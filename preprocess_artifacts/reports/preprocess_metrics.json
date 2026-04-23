@@ -1,0 +1,33 @@
+{
+  "source_order_rows": 2169,
+  "source_customer_rows": 98,
+  "source_node_rows": 99,
+  "source_distance_shape": [
+    99,
+    100
+  ],
+  "missing_weight_rows": 14,
+  "missing_volume_rows": 16,
+  "imputed_weight_rows": 14,
+  "imputed_volume_rows": 16,
+  "total_imputed_rows": 30,
+  "oversize_order_count": 2,
+  "zero_demand_customer_count": 10,
+  "active_customer_count": 88,
+  "green_zone_customer_count_geometry": 15,
+  "problem_statement_green_zone_count": 30,
+  "green_zone_count_conflict": true,
+  "split_required_customer_count": 37,
+  "fuel_forbidden_all_window_count": 9,
+  "fuel_allowed_after_16_count": 6,
+  "mandatory_ev_customer_count": 9,
+  "mandatory_ev_active_customer_count": 8,
+  "mandatory_ev_total_orders": 226,
+  "mandatory_ev_total_weight": 30149.461954200156,
+  "mandatory_ev_total_volume": 84.00564787051664,
+  "optimistic_lb_trips_weight": 11,
+  "optimistic_lb_trips_volume": 6,
+  "one_wave_ev_fleet_weight_capacity": 48750.0,
+  "one_wave_ev_fleet_volume_capacity": 277.5,
+  "within_one_wave_ev_fleet_capacity": true
+}

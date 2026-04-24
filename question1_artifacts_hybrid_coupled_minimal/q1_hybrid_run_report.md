@@ -1,0 +1,146 @@
+# Question 1 Solver Report
+
+## Run Summary
+- Best seed: 11
+- Seed count: 1
+- Particle count per seed: 4
+- Max generations: 3
+- Top route candidates: 8
+- Run record count: 1
+- Mutation attempts/accepted/best updates: 12/10/10
+- Service unit count: 175
+- Packing strategy: baseline
+- Cost-first improved: 1
+- Route count: 132
+- Used vehicle count: 132
+- Total cost: 87384.201
+- Startup cost: 52800.000
+- Energy cost: 27855.868
+- Carbon cost: 6009.775
+- Waiting cost: 353.752
+- Late cost: 364.806
+- Total late minutes: 437.767
+- Total fuel: 4538.817 L
+- Total electricity: 5969.220 kWh
+- Total carbon: 14550.946 kg
+- Total distance: 14880.783 km
+- Split customers: 37
+- Mandatory split customers: 37
+- Mandatory split visits: 124
+- Normal customers: 51
+- Single-stop routes: 97
+- Two-stop routes: 29
+- Three-plus-stop routes: 6
+- Heavy big-only count: 48
+- Normal heavy big-only count: 17
+- Total heavy big-only count: 65
+- Heavy big-only capacity: 48
+- Big-vehicle inventory: 70
+- Big-vehicle reserve: 5
+- Fuel 3000 used count: 60
+- Fuel 3000 free count: 0
+- Single-single merge feasible pair count: 1495
+- Single-single merge inventory-blocked pair count: 1495
+- Final current single-pairs inventory-feasible count: 0
+- Final routes with flexible units on big: 29
+- Final flexible units on big routes: 39
+- Final piggyback/promotion-like/blocking big count: 20/5/4
+- Final blocking big flexible unit count: 9
+- Diagnostic unlock success count: 0
+- Diagnostic promotion success count: 0
+- Route-pool candidate count: 2971
+- Route-pool role counts: {"singleton": 578, "flex_small": 284, "cluster_flex_small": 45, "archive_seed": 24, "current": 132, "seed": 132, "promotion": 1582, "piggyback_big": 310, "residual_promotion": 311, "rigid_big": 130}
+- Promotion-like candidate count: 1779
+- Positive-saving promotion-like candidate count: 1762
+- Piggyback-big candidate count: 314
+- Positive-saving piggyback-big candidate count: 289
+- Candidate-pool cap binding flag: 0
+- Flex-small candidate count by size: {"2": 280, "3": 48, "4": 7}
+- Selected flex-small count by size: {"2": 4, "3": 1, "4": 1}
+- Final solution source: hybrid_pass1
+- Baseline route count: 132
+- Baseline single-stop route count: 97
+- Baseline total cost: 87616.610
+- Baseline fuel 3000 used/free: 60/0
+- Baseline routes with flexible units on big: 29
+- Baseline flexible units on big routes: 39
+- Baseline piggyback/promotion-like/blocking big count: 20/5/4
+- Baseline blocking big flexible unit count: 9
+- Baseline bad big-flexible route/unit count: 10/22
+- Baseline current single-pairs feasible/inventory-feasible: 1599/0
+- Global model status: hybrid_ok
+- Global selected as final: 1
+- Global validation status: hybrid_cost_improved
+- Global route-pool candidate count: 2971
+- Route-pool iterations configured: 2
+- Global pass1 route count: 132
+- Global pass1 single-stop route count: 97
+- Global pass1 selected singleton count: 97
+- Global pass1 selected promotion count: 5
+- Global pass1 selected promotion-like/piggyback count: 5/19
+- Global pass1 big-route count: 70
+- Global pass1 mixed/blocking big route count: 28/4
+- Global pass1 bad big-flexible route/unit count: 4/9
+- Global pass2 route count: 132
+- Global pass2 single-stop route count: 97
+- Global pass2 selected singleton count: 97
+- Global pass2 selected promotion count: 5
+- Global pass2 selected promotion-like/piggyback count: 5/20
+- Global pass2 routes with flexible units on big: 29
+- Global pass2 flexible units on big routes: 39
+- Global pass2 big-route count: 70
+- Global pass2 mixed/blocking big route count: 29/4
+- Global pass2 bad big-flexible route/unit count: 4/9
+- Global pass3 route count: None
+- Global pass3 single-stop route count: None
+- Global pass3 selected singleton/flexible-singleton/rigid-big-singleton count: None/None/None
+- Global pass3 selected flex-small count: None
+- Global pass3 selected promotion-like/piggyback count: None/None
+- Global pass3 bad big-flexible route count: None
+- Global pass3 big-route count: None
+- Global final total cost: 87384.20065404079
+- Global final route count: 132
+- Global final single-stop route count: 97
+- Global final current single-pairs feasible/inventory-feasible: 1495/0
+- Global final routes with flexible units on big: 29
+- Global final flexible units on big routes: 39
+- Global final piggyback/promotion-like/blocking big count: 20/5/4
+- Global fuel 3000 used/free: 60/0
+- Split/packing sensitivity executed/status: 0/not_run_hybrid
+- Split/packing sensitivity total cost/route count: None/None
+- Reserve repair success count: 0
+- Batch merge success count: 0
+- Pre-merge single-stop route count: 101
+- Post-merge single-stop route count: 97
+- Late-positive stops: 17
+- Max late: 99.004 min
+- Latest return: 911.700 min
+- After-hours service count: 2
+- After-hours return count: 24
+- After-hours travel: 785.883 km
+- Vehicle type usage: {"ev_1250": 15, "ev_3000": 10, "fuel_1500": 47, "fuel_3000": 60}
+- Route merge successes: 0
+- Relocate successes: 0
+- Route type change successes: 4
+- Elapsed time: 158.85 s
+
+## Per-Seed Best
+
+## Cost-First MILP Phases
+- {"phase": "cost_first_total_cost", "stage": "cost_first", "status": "optimal", "fallback_used": 0, "selected_route_count": 132, "objective_value": 87384.20065404077, "pass_label": "pass1", "big_route_bound_mode": null}
+- {"phase": "cost_first_total_cost", "stage": "cost_first", "status": "optimal", "fallback_used": 0, "selected_route_count": 132, "objective_value": 87384.20065404077, "pass_label": "pass2", "big_route_bound_mode": null}
+- Seed 11: best cost 87384.201, routes 132, vehicles 132, split customers 37, single-stop routes 97, feasible particles 4, mutations attempted/accepted/best updates 12/10/10, late-positive stops 17, latest return 911.700, operators {"typed_route_merge_remove": 5, "late_route_remove": 2, "worst_cost_remove": 1, "cluster_remove": 1, "mandatory_split_cluster_remove": 3}
+
+## Hybrid Outer Search
+- Hybrid mode: minimal
+- Hybrid outer seed: 11
+- Generations completed: 3
+- Outer trace rows: 16
+- Pheromone edge/start count: 55/139
+- Elite archive size: 6
+- Baseline reference total cost/route count/single-stop: 87616.610/132/97
+- Cost best total cost/route count/single-stop/late+/maxlate: 87384.201/132/97/17/99.004
+- Balanced best total cost/route count/single-stop/late+/maxlate: 87695.293/132/96/14/99.004
+- Archive injected route count: 25
+- Archive/pheromone selected column count: 22/132
+- Cluster remove attempts/accepted: 1/0

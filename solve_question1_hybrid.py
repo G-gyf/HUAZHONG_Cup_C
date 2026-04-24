@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
 
+import numpy as np
 import pandas as pd
 
 import solve_question1 as base
@@ -30,6 +31,13 @@ HYBRID_TEMPERATURE_MAX = 2.0
 HYBRID_PROBABILITY_SHORTLIST = 6
 HYBRID_ELITE_COUNT = 2
 HYBRID_ARCHIVE_SIZE = 6
+HYBRID_ARCHIVE_INJECT_ELITE_LIMIT = 2
+HYBRID_ARCHIVE_INJECT_ROUTE_LIMIT = 20
+HYBRID_BALANCED_COST_ABS_ALLOWANCE = 300.0
+HYBRID_BALANCED_COST_REL_ALLOWANCE = 0.005
+HYBRID_ARCHIVE_SUPPORT_WEIGHT = 20.0
+HYBRID_PHEROMONE_SUPPORT_WEIGHT = 8.0
+HYBRID_BALANCED_SOURCE_PROB = 0.20
 BASELINE_REFERENCE_PARTICLES = 1
 BASELINE_REFERENCE_GENERATIONS = 2
 DEFAULT_MINIMAL_PARTICLES = 4
@@ -43,6 +51,7 @@ OUTER_OPERATOR_NAMES = (
     "late_route_remove",
     "typed_route_merge_remove",
     "mandatory_split_cluster_remove",
+    "cluster_remove",
 )
 
 
@@ -53,6 +62,8 @@ class HybridParticle:
     current_eval: base.SolutionEvaluation
     personal_best_routes: list[base.TypedRoute]
     personal_best_eval: base.SolutionEvaluation
+    personal_balanced_best_routes: list[base.TypedRoute]
+    personal_balanced_best_eval: base.SolutionEvaluation
     destroy_ratio: float
     construction_temperature: float
     operator_weights: dict[str, float]
@@ -69,6 +80,8 @@ class HybridInnerResult:
     route_pool_candidate_count: int
     route_pool_role_counts: dict[str, int]
     summary_by_label: dict[str, dict[str, object]]
+    archive_injected_route_count: int
+    selected_route_keys: set[tuple[str, tuple[int, ...]]]
 
 
 class HybridQuestion1Solver(base.Question1Solver):
@@ -101,7 +114,10 @@ class HybridQuestion1Solver(base.Question1Solver):
         self.pheromone_edge: dict[tuple[int, int, str], float] = {}
         self.pheromone_start: dict[tuple[int, str], float] = {}
         self.elite_archive: list[tuple[list[base.TypedRoute], base.SolutionEvaluation, str]] = []
+        self.observed_results: list[HybridInnerResult] = []
         self.operator_history = Counter[str]()
+        self.cluster_remove_attempt_count = 0
+        self.cluster_remove_accepted_count = 0
         self.baseline_summary = self._load_baseline_summary()
 
     def _load_baseline_summary(self) -> dict[str, object]:
@@ -170,6 +186,136 @@ class HybridQuestion1Solver(base.Question1Solver):
                 bonus *= HYBRID_GBEST_BONUS
         return bonus
 
+    def _balanced_cost_allowance(self, cost_best_eval: base.SolutionEvaluation) -> float:
+        return max(
+            HYBRID_BALANCED_COST_ABS_ALLOWANCE,
+            HYBRID_BALANCED_COST_REL_ALLOWANCE * float(cost_best_eval.total_cost),
+        )
+
+    def _balanced_solution_key(
+        self,
+        solution_eval: base.SolutionEvaluation,
+    ) -> tuple[int, float, float, int, int, float]:
+        return (
+            int(solution_eval.late_positive_stops),
+            round(solution_eval.max_late_min, 6),
+            round(solution_eval.total_late_min, 6),
+            int(solution_eval.route_count),
+            int(solution_eval.single_stop_route_count),
+            round(solution_eval.total_cost, 6),
+        )
+
+    def _is_within_balanced_band(
+        self,
+        candidate_eval: base.SolutionEvaluation,
+        cost_best_eval: base.SolutionEvaluation,
+    ) -> bool:
+        return float(candidate_eval.total_cost) <= float(cost_best_eval.total_cost) + self._balanced_cost_allowance(cost_best_eval)
+
+    def _is_balanced_better(
+        self,
+        candidate_eval: base.SolutionEvaluation,
+        reference_eval: base.SolutionEvaluation | None,
+        cost_best_eval: base.SolutionEvaluation,
+    ) -> bool:
+        if not self._is_within_balanced_band(candidate_eval, cost_best_eval):
+            return False
+        return reference_eval is None or self._balanced_solution_key(candidate_eval) < self._balanced_solution_key(reference_eval)
+
+    def _route_signature(self, routes: Iterable[base.TypedRoute]) -> tuple[tuple[str, tuple[int, ...]], ...]:
+        return tuple(sorted(self._route_key(route) for route in routes))
+
+    def _register_observed_result(self, inner_result: HybridInnerResult) -> None:
+        candidate_signature = self._route_signature(inner_result.routes)
+        retained: list[HybridInnerResult] = [inner_result]
+        seen_signatures = {candidate_signature}
+        for observed in self.observed_results:
+            observed_signature = self._route_signature(observed.routes)
+            if observed_signature in seen_signatures:
+                continue
+            retained.append(observed)
+            seen_signatures.add(observed_signature)
+        retained.sort(key=lambda item: self._outer_solution_key(item.solution_eval))
+        self.observed_results = retained[:64]
+
+    def _select_balanced_best(
+        self,
+        cost_best: HybridInnerResult,
+    ) -> HybridInnerResult:
+        balanced_candidates = [
+            inner_result
+            for inner_result in self.observed_results
+            if self._is_within_balanced_band(inner_result.solution_eval, cost_best.solution_eval)
+        ]
+        if not balanced_candidates:
+            return cost_best
+        return min(
+            balanced_candidates,
+            key=lambda item: self._balanced_solution_key(item.solution_eval),
+        )
+
+    def _archive_routes_for_injection(self) -> list[base.TypedRoute]:
+        candidate_routes: list[base.TypedRoute] = []
+        for archive_routes, _, _ in self.elite_archive[:HYBRID_ARCHIVE_INJECT_ELITE_LIMIT]:
+            injected = 0
+            for route in archive_routes:
+                promotion_like_flag, piggyback_flag, _, _, _, _, _ = self._route_big_structure_metrics(route)
+                if piggyback_flag or promotion_like_flag:
+                    candidate_routes.append(route)
+                    injected += 1
+                elif route.vehicle_type not in {"fuel_3000", "ev_3000"} and 2 <= len(route.unit_ids) <= 4:
+                    candidate_routes.append(route)
+                    injected += 1
+                elif len(route.unit_ids) >= 2:
+                    candidate_routes.append(route)
+                    injected += 1
+                if injected >= HYBRID_ARCHIVE_INJECT_ROUTE_LIMIT:
+                    break
+        deduped_routes: list[base.TypedRoute] = []
+        seen_keys: set[tuple[str, tuple[int, ...]]] = set()
+        for route in candidate_routes:
+            route_key = self._route_key(route)
+            if route_key in seen_keys:
+                continue
+            deduped_routes.append(base.TypedRoute(route.vehicle_type, tuple(route.unit_ids)))
+            seen_keys.add(route_key)
+        return deduped_routes
+
+    def _inject_archive_routes_into_pool(
+        self,
+        route_pool: dict[tuple[str, tuple[int, ...]], base.CandidateRouteSpec],
+    ) -> int:
+        archive_routes = self._archive_routes_for_injection()
+        injected_count = 0
+        for route in archive_routes:
+            previous_size = len(route_pool)
+            self._register_candidate_route(route_pool, route.vehicle_type, route.unit_ids, "archive_seed")
+            route_key = self._route_key(route)
+            if route_key in route_pool:
+                route_pool[route_key].roles.add("archive_seed")
+            if len(route_pool) > previous_size or route_key in route_pool:
+                injected_count += 1
+        return injected_count
+
+    def _archive_support_count_for_column(self, column: dict[str, object]) -> int:
+        candidate_route = base.TypedRoute(str(column["vehicle_type"]), tuple(int(unit_id) for unit_id in column["unit_ids"]))
+        candidate_starts, candidate_edges = self._extract_route_feature_sets(candidate_route)
+        candidate_unit_set = frozenset(int(unit_id) for unit_id in column["unit_ids"])
+        support_count = 0
+        for archive_routes, _, _ in self.elite_archive[:HYBRID_ARCHIVE_INJECT_ELITE_LIMIT]:
+            for archive_route in archive_routes[:HYBRID_ARCHIVE_INJECT_ROUTE_LIMIT]:
+                archive_unit_set = frozenset(int(unit_id) for unit_id in archive_route.unit_ids)
+                if archive_route.vehicle_type == candidate_route.vehicle_type and archive_unit_set == candidate_unit_set:
+                    support_count += 2
+                    continue
+                archive_starts, archive_edges = self._extract_route_feature_sets(archive_route)
+                if (candidate_starts & archive_starts) or (candidate_edges & archive_edges):
+                    support_count += 1
+        return int(support_count)
+
+    def _pheromone_support_score_for_route(self, route: base.TypedRoute) -> float:
+        return self._route_tau_average(route)
+
     def _rank_key_penalty(
         self,
         rank_key: tuple[int, int, float, tuple[float, float, int]],
@@ -178,6 +324,224 @@ class HybridQuestion1Solver(base.Question1Solver):
         mixed_big_penalty = 120.0 * float(rank_key[1])
         vehicle_penalty = 0.01 * float(rank_key[3][0]) + 0.1 * float(rank_key[3][1]) + 5.0 * float(rank_key[3][2])
         return reserve_penalty + mixed_big_penalty + vehicle_penalty
+
+    def _column_candidate_score(self, column: dict[str, object]) -> float:
+        base_score = super()._column_candidate_score(column)
+        return float(
+            base_score
+            + HYBRID_ARCHIVE_SUPPORT_WEIGHT * float(column.get("archive_support_count", 0))
+            + HYBRID_PHEROMONE_SUPPORT_WEIGHT * math.log1p(float(column.get("pheromone_support_score", 0.0)))
+        )
+
+    def _column_candidate_sort_key(self, column: dict[str, object]) -> tuple[float, float, float, float, int, float, str, tuple[int, ...]]:
+        return (
+            -float(column.get("coupled_candidate_score", column.get("candidate_score", 0.0))),
+            -float(column["current_cost_saving"]),
+            -float(column["avg_time_window_overlap_min"]),
+            float(column["avg_customer_distance_km"]),
+            -int(column["unit_count"]),
+            float(column["best_cost"]),
+            str(column["vehicle_type"]),
+            tuple(int(unit_id) for unit_id in column["unit_ids"]),
+        )
+
+    def _build_route_pool_columns(
+        self,
+        seed_routes: list[base.TypedRoute],
+        route_pool: dict[tuple[str, tuple[int, ...]], base.CandidateRouteSpec] | None = None,
+        max_columns: int = base.ROUTE_POOL_MAX_COLUMNS,
+        promotion_limit: int = base.ROUTE_POOL_PROMOTION_LIMIT,
+        flex_small_limit: int = base.ROUTE_POOL_FLEX_SMALL_LIMIT,
+        residual_promotion_limit: int = base.ROUTE_POOL_RESIDUAL_PROMOTION_LIMIT,
+        residual_flex_small_limit: int = base.ROUTE_POOL_RESIDUAL_FLEX_SMALL_LIMIT,
+        residual_saving_by_key: dict[tuple[str, tuple[int, ...]], float] | None = None,
+    ) -> list[dict[str, object]]:
+        raw_pool = route_pool if route_pool is not None else self._generate_route_pool(seed_routes)
+        archive_injected_route_count = self._inject_archive_routes_into_pool(raw_pool)
+        self._latest_archive_injected_route_count = archive_injected_route_count
+        residual_saving_by_key = residual_saving_by_key or {}
+        current_route_by_unit = {
+            int(unit_id): route
+            for route in seed_routes
+            for unit_id in route.unit_ids
+        }
+        current_route_cost_by_key = {
+            self._route_key(route): float(self.evaluate_route(route).best_cost)
+            for route in seed_routes
+        }
+        singleton_cost_by_unit: dict[int, float] = {}
+        for spec in raw_pool.values():
+            if len(spec.route.unit_ids) != 1:
+                continue
+            unit_id = spec.route.unit_ids[0]
+            singleton_cost_by_unit[unit_id] = min(singleton_cost_by_unit.get(unit_id, np.inf), spec.route_eval.best_cost)
+
+        grouped_columns: dict[tuple[str, frozenset[int]], list[dict[str, object]]] = defaultdict(list)
+        for key, spec in raw_pool.items():
+            roles = set(spec.roles)
+            if "seed" in roles:
+                roles.add("current")
+            (
+                promotion_like_big_route_flag,
+                piggyback_big_route_flag,
+                blocking_big_flexible_route_flag,
+                blocking_big_flexible_unit_count,
+                big_route_flag,
+                big_flexible_unit_count,
+                heavy_big_only_unit_count,
+            ) = self._route_big_structure_metrics(spec.route)
+            big_flexible_route_flag = int(big_flexible_unit_count > 0)
+            current_cover_keys = {
+                self._route_key(current_route_by_unit[unit_id])
+                for unit_id in spec.route.unit_ids
+                if unit_id in current_route_by_unit
+            }
+            current_cover_cost = float(sum(current_route_cost_by_key.get(route_key, 0.0) for route_key in current_cover_keys))
+            current_cost_saving = current_cover_cost - float(spec.route_eval.best_cost)
+            avg_time_window_overlap_min = self._average_time_window_overlap_minutes(spec.route.unit_ids)
+            avg_customer_distance_km = self._average_customer_distance_km(spec.route.unit_ids)
+            candidate_family = "support"
+            if piggyback_big_route_flag:
+                candidate_family = "piggyback_big"
+            elif promotion_like_big_route_flag:
+                candidate_family = "promotion_like_big"
+            elif (
+                roles & {"flex_small", "residual_flex_small", "cluster_flex_small"}
+                and 2 <= len(spec.route.unit_ids) <= 4
+            ):
+                candidate_family = "flex_small"
+            elif roles & {"seed", "current", "archive_seed"}:
+                candidate_family = "seed_current"
+
+            archive_support_count = self._archive_support_count_for_column(
+                {
+                    "vehicle_type": spec.route.vehicle_type,
+                    "unit_ids": spec.route.unit_ids,
+                }
+            )
+            pheromone_support_score = self._pheromone_support_score_for_route(spec.route)
+
+            grouped_columns[(spec.route.vehicle_type, frozenset(spec.route.unit_ids))].append(
+                {
+                    "key": key,
+                    "vehicle_type": spec.route.vehicle_type,
+                    "unit_ids": spec.route.unit_ids,
+                    "unit_set": frozenset(spec.route.unit_ids),
+                    "unit_count": int(len(spec.route.unit_ids)),
+                    "best_cost": float(spec.route_eval.best_cost),
+                    "single_stop_flag": int(len(spec.route.unit_ids) == 1),
+                    "big_route_flag": big_route_flag,
+                    "big_flexible_route_flag": int(big_flexible_route_flag),
+                    "big_flexible_unit_count": int(big_flexible_unit_count),
+                    "mixed_big_route_flag": int(big_flexible_unit_count > 0),
+                    "piggyback_big_route_flag": int(piggyback_big_route_flag),
+                    "promotion_like_big_route_flag": int(promotion_like_big_route_flag),
+                    "blocking_big_flexible_route_flag": int(blocking_big_flexible_route_flag),
+                    "blocking_big_flexible_unit_count": int(blocking_big_flexible_unit_count),
+                    "bad_big_flexible_route_flag": int(blocking_big_flexible_route_flag),
+                    "bad_big_flexible_unit_count": int(blocking_big_flexible_unit_count),
+                    "heavy_big_only_unit_count": int(heavy_big_only_unit_count),
+                    "roles": tuple(sorted(roles)),
+                    "promotion_saving": float(
+                        sum(singleton_cost_by_unit.get(int(unit_id), 0.0) for unit_id in spec.route.unit_ids)
+                        - float(spec.route_eval.best_cost)
+                    ),
+                    "current_cover_cost": current_cover_cost,
+                    "current_cover_route_count": int(len(current_cover_keys)),
+                    "current_cost_saving": current_cost_saving,
+                    "saving_vs_pass1_singletons": residual_saving_by_key.get(key),
+                    "avg_time_window_overlap_min": avg_time_window_overlap_min,
+                    "avg_customer_distance_km": avg_customer_distance_km,
+                    "candidate_family": candidate_family,
+                    "pool_pass": self._column_pool_pass(roles),
+                    "route": spec.route,
+                    "route_eval": spec.route_eval,
+                    "archive_support_count": archive_support_count,
+                    "pheromone_support_score": pheromone_support_score,
+                }
+            )
+
+        deduped_columns: list[dict[str, object]] = []
+        for _, candidates in grouped_columns.items():
+            candidates.sort(
+                key=lambda item: (
+                    item["best_cost"],
+                    -len(item["unit_ids"]),
+                    item["unit_ids"],
+                )
+            )
+            best_candidate = dict(candidates[0])
+            merged_roles = sorted({role for candidate in candidates for role in candidate["roles"]})
+            residual_savings = [candidate["saving_vs_pass1_singletons"] for candidate in candidates if candidate["saving_vs_pass1_singletons"] is not None]
+            best_candidate["roles"] = tuple(merged_roles)
+            best_candidate["pool_pass"] = self._column_pool_pass(merged_roles)
+            best_candidate["saving_vs_pass1_singletons"] = max(residual_savings) if residual_savings else None
+            best_candidate["archive_support_count"] = max(int(candidate.get("archive_support_count", 0)) for candidate in candidates)
+            best_candidate["pheromone_support_score"] = max(float(candidate.get("pheromone_support_score", 0.0)) for candidate in candidates)
+            best_candidate["candidate_score"] = super()._column_candidate_score(best_candidate)
+            best_candidate["coupled_candidate_score"] = self._column_candidate_score(best_candidate)
+            deduped_columns.append(best_candidate)
+
+        support_columns: list[dict[str, object]] = []
+        flex_small_columns: list[dict[str, object]] = []
+        promotion_like_columns: list[dict[str, object]] = []
+        piggyback_big_columns: list[dict[str, object]] = []
+        overflow_columns: list[dict[str, object]] = []
+        for column in deduped_columns:
+            roles = set(column["roles"])
+            if roles & {"seed", "current", "rigid_big", "singleton"}:
+                support_columns.append(column)
+            elif column["candidate_family"] == "piggyback_big" and float(column["current_cost_saving"]) > base.COST_IMPROVEMENT_EPS:
+                piggyback_big_columns.append(column)
+            elif (
+                column["candidate_family"] == "promotion_like_big"
+                and float(column["current_cost_saving"]) > base.COST_IMPROVEMENT_EPS
+            ):
+                promotion_like_columns.append(column)
+            elif (
+                column["candidate_family"] == "flex_small"
+                and float(column["current_cost_saving"]) > base.COST_IMPROVEMENT_EPS
+            ):
+                flex_small_columns.append(column)
+            else:
+                overflow_columns.append(column)
+
+        flex_small_columns.sort(key=self._column_candidate_sort_key)
+        piggyback_big_columns.sort(key=self._column_candidate_sort_key)
+        promotion_like_columns.sort(key=self._column_candidate_sort_key)
+        overflow_columns.sort(key=self._column_candidate_sort_key)
+
+        selected_columns: list[dict[str, object]] = []
+        seen_keys: set[tuple[str, tuple[int, ...]]] = set()
+
+        def add_columns(columns: Iterable[dict[str, object]]) -> None:
+            for column in columns:
+                if column["key"] in seen_keys:
+                    continue
+                selected_columns.append(column)
+                seen_keys.add(column["key"])
+
+        add_columns(support_columns)
+        add_columns(flex_small_columns[:flex_small_limit])
+        add_columns(piggyback_big_columns[: base.ROUTE_POOL_PIGGYBACK_BIG_LIMIT])
+        add_columns(promotion_like_columns[:promotion_limit])
+
+        if len(selected_columns) < max_columns:
+            remaining_columns = [
+                column
+                for column in (
+                    flex_small_columns[flex_small_limit:]
+                    + piggyback_big_columns[base.ROUTE_POOL_PIGGYBACK_BIG_LIMIT:]
+                    + promotion_like_columns[promotion_limit:]
+                    + overflow_columns
+                )
+                if column["key"] not in seen_keys
+            ]
+            remaining_columns.sort(key=self._column_candidate_sort_key)
+            add_columns(remaining_columns[: max(0, max_columns - len(selected_columns))])
+
+        selected_columns.sort(key=lambda item: (item["vehicle_type"], item["unit_ids"]))
+        return selected_columns
 
     def _weighted_route_choice(
         self,
@@ -387,6 +751,18 @@ class HybridQuestion1Solver(base.Question1Solver):
         total = float(sum(normalized.values()))
         return {name: value / total for name, value in normalized.items()}
 
+    def _initial_operator_weights(self) -> dict[str, float]:
+        return self._normalize_operator_weights(
+            {
+                "random_remove": 0.18,
+                "worst_cost_remove": 0.18,
+                "late_route_remove": 0.16,
+                "typed_route_merge_remove": 0.16,
+                "mandatory_split_cluster_remove": 0.12,
+                "cluster_remove": 0.20,
+            }
+        )
+
     def _mutate_particle_parameters(
         self,
         particle: HybridParticle,
@@ -411,15 +787,22 @@ class HybridQuestion1Solver(base.Question1Solver):
     def _choose_source_solution(
         self,
         particle: HybridParticle,
-        global_best: HybridInnerResult,
+        global_best_cost: HybridInnerResult,
+        global_best_balanced: HybridInnerResult,
         rng: random.Random,
     ) -> tuple[str, list[base.TypedRoute], base.SolutionEvaluation]:
         draw = rng.random()
-        if draw < 0.4:
+        if draw < 0.35:
             return "current", self._clone_routes(particle.current_routes), particle.current_eval
-        if draw < 0.7:
+        if draw < 0.60:
             return "personal_best", self._clone_routes(particle.personal_best_routes), particle.personal_best_eval
-        return "global_best", self._clone_routes(global_best.routes), global_best.solution_eval
+        if draw < 0.80:
+            return "global_best_cost", self._clone_routes(global_best_cost.routes), global_best_cost.solution_eval
+        return (
+            "global_best_balanced",
+            self._clone_routes(global_best_balanced.routes),
+            global_best_balanced.solution_eval,
+        )
 
     def _choose_destroy_operator(
         self,
@@ -435,6 +818,67 @@ class HybridQuestion1Solver(base.Question1Solver):
                 return operator_name
         return OUTER_OPERATOR_NAMES[-1]
 
+    def _route_center(self, route: base.TypedRoute) -> tuple[float, float]:
+        units = [self.unit_by_id[unit_id] for unit_id in route.unit_ids]
+        return (
+            float(sum(unit.x_km for unit in units) / max(len(units), 1)),
+            float(sum(unit.y_km for unit in units) / max(len(units), 1)),
+        )
+
+    def _route_pair_cluster_score(
+        self,
+        left_route: base.TypedRoute,
+        right_route: base.TypedRoute,
+    ) -> tuple[float, float, int]:
+        overlap = 0.0
+        for left_unit_id in left_route.unit_ids:
+            for right_unit_id in right_route.unit_ids:
+                overlap = max(overlap, self._time_window_overlap_minutes(left_unit_id, right_unit_id))
+        left_center = self._route_center(left_route)
+        right_center = self._route_center(right_route)
+        distance = math.hypot(left_center[0] - right_center[0], left_center[1] - right_center[1])
+        return (-overlap, distance, len(right_route.unit_ids))
+
+    def _cluster_remove(
+        self,
+        solution_eval: base.SolutionEvaluation,
+        q_remove: int,
+        rng: random.Random,
+    ) -> tuple[list[base.TypedRoute], list[int]]:
+        candidate_routes = [
+            base.TypedRoute(route.vehicle_type, tuple(route.unit_ids))
+            for route in solution_eval.assigned_routes
+            if len(route.unit_ids) <= 4
+        ]
+        if not candidate_routes:
+            return self._random_remove(
+                [base.TypedRoute(route.vehicle_type, tuple(route.unit_ids)) for route in solution_eval.assigned_routes],
+                q_remove,
+                rng,
+            )
+        seed_route = rng.choice(candidate_routes)
+        selected_routes = [seed_route]
+        selected_unit_count = len(seed_route.unit_ids)
+        related_routes = sorted(
+            [route for route in candidate_routes if self._route_key(route) != self._route_key(seed_route)],
+            key=lambda route: self._route_pair_cluster_score(seed_route, route),
+        )
+        for route in related_routes:
+            if selected_unit_count + len(route.unit_ids) > q_remove and selected_routes:
+                continue
+            selected_routes.append(route)
+            selected_unit_count += len(route.unit_ids)
+            if len(selected_routes) >= 3 or selected_unit_count >= q_remove:
+                break
+        remove_keys = {self._route_key(route) for route in selected_routes}
+        removed_units = [unit_id for route in selected_routes for unit_id in route.unit_ids]
+        partial_routes = [
+            base.TypedRoute(route.vehicle_type, tuple(route.unit_ids))
+            for route in solution_eval.assigned_routes
+            if self._route_key(base.TypedRoute(route.vehicle_type, tuple(route.unit_ids))) not in remove_keys
+        ]
+        return partial_routes, removed_units
+
     def _destroy_solution(
         self,
         routes: list[base.TypedRoute],
@@ -449,6 +893,9 @@ class HybridQuestion1Solver(base.Question1Solver):
         q_remove = max(1, min(q_remove, len(flat_units)))
         operator_name = self._choose_destroy_operator(operator_weights, rng)
         self.operator_history[operator_name] += 1
+        if operator_name == "cluster_remove":
+            self.cluster_remove_attempt_count += 1
+            return (*self._cluster_remove(solution_eval, q_remove, rng), operator_name)
         if operator_name == "random_remove":
             return (*self._random_remove(routes, q_remove, rng), operator_name)
         if operator_name == "worst_cost_remove":
@@ -532,6 +979,9 @@ class HybridQuestion1Solver(base.Question1Solver):
                     "blocking_big_flexible_unit_count": int(column["blocking_big_flexible_unit_count"]),
                     "avg_time_window_overlap_min": round(float(column["avg_time_window_overlap_min"]), 6),
                     "candidate_score": round(float(column["candidate_score"]), 6),
+                    "coupled_candidate_score": round(float(column.get("coupled_candidate_score", column["candidate_score"])), 6),
+                    "archive_support_count": int(column.get("archive_support_count", 0)),
+                    "pheromone_support_score": round(float(column.get("pheromone_support_score", 0.0)), 6),
                     "candidate_family": column["candidate_family"],
                     "pool_pass": column["pool_pass"],
                     "roles": ",".join(column["roles"]),
@@ -539,9 +989,44 @@ class HybridQuestion1Solver(base.Question1Solver):
                     "selected_in_pass2": int(route_key in pass2_keys),
                     "selected_in_pass3": int(route_key in pass3_keys),
                     "selected_in_final": int(route_key in active_keys),
+                    "selected_in_cost_best": 0,
+                    "selected_in_balanced_best": 0,
                 }
             )
         return rows
+
+    def _merge_route_pool_summary_rows(
+        self,
+        cost_best: HybridInnerResult,
+        balanced_best: HybridInnerResult,
+    ) -> list[dict[str, object]]:
+        merged_rows: dict[str, dict[str, object]] = {}
+        cost_keys = {f"{route.vehicle_type}|{','.join(str(unit_id) for unit_id in route.unit_ids)}" for route in cost_best.routes}
+        balanced_keys = {f"{route.vehicle_type}|{','.join(str(unit_id) for unit_id in route.unit_ids)}" for route in balanced_best.routes}
+        for row in [*cost_best.route_pool_summary_rows, *balanced_best.route_pool_summary_rows]:
+            route_key = str(row["route_key"])
+            candidate = merged_rows.get(route_key)
+            if candidate is None:
+                candidate = dict(row)
+                candidate["selected_in_cost_best"] = 0
+                candidate["selected_in_balanced_best"] = 0
+                merged_rows[route_key] = candidate
+            else:
+                for field_name in (
+                    "candidate_score",
+                    "coupled_candidate_score",
+                    "archive_support_count",
+                    "pheromone_support_score",
+                    "current_cost_saving",
+                    "avg_time_window_overlap_min",
+                ):
+                    candidate[field_name] = max(candidate.get(field_name, 0), row.get(field_name, 0))
+                if not candidate.get("roles") and row.get("roles"):
+                    candidate["roles"] = row["roles"]
+        for route_key, row in merged_rows.items():
+            row["selected_in_cost_best"] = int(route_key in cost_keys)
+            row["selected_in_balanced_best"] = int(route_key in balanced_keys)
+        return sorted(merged_rows.values(), key=lambda item: (str(item["vehicle_type"]), str(item["unit_ids"])))
 
     def _inner_refine_solution(
         self,
@@ -600,6 +1085,8 @@ class HybridQuestion1Solver(base.Question1Solver):
             route_pool_candidate_count=len(global_result["columns"]),
             route_pool_role_counts=dict(route_pool_role_counts),
             summary_by_label=summary_by_label,
+            archive_injected_route_count=int(getattr(self, "_latest_archive_injected_route_count", 0)),
+            selected_route_keys={self._route_key(route) for route in best_routes},
         )
 
     def _update_elite_archive(
@@ -650,7 +1137,8 @@ class HybridQuestion1Solver(base.Question1Solver):
     def _update_pheromones(
         self,
         particles: list[HybridParticle],
-        global_best: HybridInnerResult,
+        global_best_cost: HybridInnerResult,
+        global_best_balanced: HybridInnerResult,
     ) -> None:
         self._evaporate_pheromones()
         elite_candidates = sorted(
@@ -659,7 +1147,13 @@ class HybridQuestion1Solver(base.Question1Solver):
         )[:HYBRID_ELITE_COUNT]
         for routes, solution_eval in elite_candidates:
             self._deposit_solution_pheromone(routes, solution_eval, multiplier=1.0)
-        self._deposit_solution_pheromone(global_best.routes, global_best.solution_eval, multiplier=1.5)
+        self._deposit_solution_pheromone(global_best_cost.routes, global_best_cost.solution_eval, multiplier=1.5)
+        if self._route_signature(global_best_balanced.routes) != self._route_signature(global_best_cost.routes):
+            self._deposit_solution_pheromone(
+                global_best_balanced.routes,
+                global_best_balanced.solution_eval,
+                multiplier=1.0,
+            )
 
     def _run_baseline_reference(self) -> tuple[base.SolutionEvaluation, list[base.TypedRoute], dict[str, object]]:
         baseline_solver = base.Question1Solver(
@@ -702,23 +1196,124 @@ class HybridQuestion1Solver(base.Question1Solver):
             }
         ]
 
+    def _selected_route_pool_support_counts(
+        self,
+        rows: list[dict[str, object]],
+        selected_field: str,
+    ) -> tuple[int, int]:
+        selected_rows = [row for row in rows if int(row.get(selected_field, 0)) == 1]
+        archive_selected = sum(1 for row in selected_rows if int(row.get("archive_support_count", 0)) > 0)
+        pheromone_selected = sum(
+            1
+            for row in selected_rows
+            if float(row.get("pheromone_support_score", 0.0)) > HYBRID_TAU0 + 1e-9
+        )
+        return int(archive_selected), int(pheromone_selected)
+
+    def _route_pool_rows_for_selected_flag(
+        self,
+        rows: list[dict[str, object]],
+        selected_field: str,
+    ) -> list[dict[str, object]]:
+        projected_rows: list[dict[str, object]] = []
+        for row in rows:
+            projected_row = dict(row)
+            projected_row["selected_in_final"] = int(row.get(selected_field, 0))
+            projected_rows.append(projected_row)
+        return projected_rows
+
+    def _result_specific_metadata(
+        self,
+        metadata: dict[str, object],
+        inner_result: HybridInnerResult,
+        route_pool_rows: list[dict[str, object]],
+        final_source_name: str,
+    ) -> dict[str, object]:
+        result_metadata = dict(metadata)
+        result_routes = inner_result.routes
+        result_eval = inner_result.solution_eval
+        result_route_counts = self._route_counts(result_routes)
+        result_big_diagnostics = self._solution_big_route_diagnostics(result_routes)
+        result_pairs_feasible, result_pairs_inventory_feasible = self._current_single_pair_inventory_counts(result_routes)
+        result_metadata.update(
+            {
+                "run_records": self._build_hybrid_run_record(result_eval),
+                "fuel_3000_used_count": result_route_counts.get("fuel_3000", 0),
+                "fuel_3000_free_count": self._fuel_3000_free_count(result_route_counts),
+                "single_single_merge_feasible_pair_count": result_pairs_feasible,
+                "single_single_merge_inventory_blocked_pair_count": max(
+                    result_pairs_feasible - result_pairs_inventory_feasible,
+                    0,
+                ),
+                "final_current_single_pairs_inventory_feasible": result_pairs_inventory_feasible,
+                "merge_diagnostics_rows": inner_result.phase_statuses,
+                "route_pool_summary_rows": route_pool_rows,
+                "final_routes_with_flexible_units_on_big": result_big_diagnostics["mixed_big_route_count"],
+                "final_flexible_units_on_big_routes": result_big_diagnostics["mixed_big_flexible_unit_count"],
+                "final_piggyback_big_count": result_big_diagnostics["piggyback_big_count"],
+                "final_promotion_like_big_count": result_big_diagnostics["promotion_like_big_count"],
+                "final_blocking_big_flexible_count": result_big_diagnostics["blocking_big_flexible_count"],
+                "final_blocking_big_flexible_unit_count": result_big_diagnostics["blocking_big_flexible_unit_count"],
+                "route_pool_candidate_count": inner_result.route_pool_candidate_count,
+                "route_pool_role_counts": inner_result.route_pool_role_counts,
+                "global_phase_statuses": inner_result.phase_statuses,
+                "global_route_pool_candidate_count": inner_result.route_pool_candidate_count,
+                "global_final_total_cost": result_eval.total_cost,
+                "global_final_route_count": result_eval.route_count,
+                "global_final_single_stop_route_count": result_eval.single_stop_route_count,
+                "global_final_current_single_pairs_feasible": result_pairs_feasible,
+                "global_final_current_single_pairs_inventory_feasible": result_pairs_inventory_feasible,
+                "global_final_routes_with_flexible_units_on_big": result_big_diagnostics["mixed_big_route_count"],
+                "global_final_flexible_units_on_big_routes": result_big_diagnostics["mixed_big_flexible_unit_count"],
+                "global_final_piggyback_big_count": result_big_diagnostics["piggyback_big_count"],
+                "global_final_promotion_like_big_count": result_big_diagnostics["promotion_like_big_count"],
+                "global_final_blocking_big_flexible_count": result_big_diagnostics["blocking_big_flexible_count"],
+                "global_final_blocking_big_flexible_unit_count": result_big_diagnostics["blocking_big_flexible_unit_count"],
+                "global_fuel_3000_used_count": result_route_counts.get("fuel_3000", 0),
+                "global_fuel_3000_free_count": self._fuel_3000_free_count(result_route_counts),
+                "final_solution_source": final_source_name,
+            }
+        )
+        return result_metadata
+
     def _build_hybrid_metadata(
         self,
-        final_inner: HybridInnerResult,
+        cost_best: HybridInnerResult,
+        balanced_best: HybridInnerResult,
         baseline_reference_eval: base.SolutionEvaluation,
         baseline_reference_routes: list[base.TypedRoute],
         baseline_reference_metadata: dict[str, object],
         elapsed_sec: float,
         generations_completed: int,
     ) -> dict[str, object]:
-        final_routes = final_inner.routes
-        final_eval = final_inner.solution_eval
-        final_route_counts = self._route_counts(final_routes)
-        final_big_diagnostics = self._solution_big_route_diagnostics(final_routes)
-        final_pairs_feasible, final_pairs_inventory_feasible = self._current_single_pair_inventory_counts(final_routes)
+        cost_eval = cost_best.solution_eval
+        cost_routes = cost_best.routes
+        cost_route_counts = self._route_counts(cost_routes)
+        cost_big_diagnostics = self._solution_big_route_diagnostics(cost_routes)
+        cost_pairs_feasible, cost_pairs_inventory_feasible = self._current_single_pair_inventory_counts(cost_routes)
+        balanced_eval = balanced_best.solution_eval
+        balanced_route_counts = self._route_counts(balanced_best.routes)
+        balanced_big_diagnostics = self._solution_big_route_diagnostics(balanced_best.routes)
+        merged_route_pool_rows = self._merge_route_pool_summary_rows(cost_best, balanced_best)
+        cost_route_pool_rows = self._route_pool_rows_for_selected_flag(merged_route_pool_rows, "selected_in_cost_best")
+        balanced_route_pool_rows = self._route_pool_rows_for_selected_flag(
+            merged_route_pool_rows,
+            "selected_in_balanced_best",
+        )
+        cost_archive_selected_count, cost_pheromone_selected_count = self._selected_route_pool_support_counts(
+            merged_route_pool_rows,
+            "selected_in_cost_best",
+        )
+        balanced_archive_selected_count, balanced_pheromone_selected_count = self._selected_route_pool_support_counts(
+            merged_route_pool_rows,
+            "selected_in_balanced_best",
+        )
+        merged_role_counts = Counter[str](cost_best.route_pool_role_counts)
+        for role_name, role_count in balanced_best.route_pool_role_counts.items():
+            merged_role_counts[role_name] = max(merged_role_counts.get(role_name, 0), int(role_count))
         baseline_summary = self.baseline_summary
         cost_improved_vs_baseline = (
-            float(final_eval.total_cost) + base.COST_IMPROVEMENT_EPS
+            float(cost_eval.total_cost) + base.COST_IMPROVEMENT_EPS
             < float(baseline_summary.get("total_cost", baseline_reference_eval.total_cost))
         )
         metadata = dict(baseline_reference_metadata)
@@ -726,7 +1321,7 @@ class HybridQuestion1Solver(base.Question1Solver):
             {
                 "best_seed": self.hybrid_seed,
                 "elapsed_sec": elapsed_sec,
-                "run_records": self._build_hybrid_run_record(final_eval),
+                "run_records": self._build_hybrid_run_record(cost_eval),
                 "seed_list": [self.hybrid_seed],
                 "seed_count": 1,
                 "particle_count": self.particle_count,
@@ -747,24 +1342,25 @@ class HybridQuestion1Solver(base.Question1Solver):
                 "cost_first_improved": int(cost_improved_vs_baseline),
                 "service_unit_count": len(self.service_units),
                 "route_cache_size": len(self.route_cache._cache),
-                "fuel_3000_used_count": final_route_counts.get("fuel_3000", 0),
-                "fuel_3000_free_count": self._fuel_3000_free_count(final_route_counts),
-                "single_single_merge_feasible_pair_count": final_pairs_feasible,
+                "fuel_3000_used_count": cost_route_counts.get("fuel_3000", 0),
+                "fuel_3000_free_count": self._fuel_3000_free_count(cost_route_counts),
+                "single_single_merge_feasible_pair_count": cost_pairs_feasible,
                 "single_single_merge_inventory_blocked_pair_count": max(
-                    final_pairs_feasible - final_pairs_inventory_feasible,
+                    cost_pairs_feasible - cost_pairs_inventory_feasible,
                     0,
                 ),
-                "final_current_single_pairs_inventory_feasible": final_pairs_inventory_feasible,
-                "merge_diagnostics_rows": final_inner.phase_statuses,
-                "route_pool_summary_rows": final_inner.route_pool_summary_rows,
-                "final_routes_with_flexible_units_on_big": final_big_diagnostics["mixed_big_route_count"],
-                "final_flexible_units_on_big_routes": final_big_diagnostics["mixed_big_flexible_unit_count"],
-                "final_piggyback_big_count": final_big_diagnostics["piggyback_big_count"],
-                "final_promotion_like_big_count": final_big_diagnostics["promotion_like_big_count"],
-                "final_blocking_big_flexible_count": final_big_diagnostics["blocking_big_flexible_count"],
-                "final_blocking_big_flexible_unit_count": final_big_diagnostics["blocking_big_flexible_unit_count"],
-                "route_pool_candidate_count": final_inner.route_pool_candidate_count,
-                "route_pool_role_counts": final_inner.route_pool_role_counts,
+                "final_current_single_pairs_inventory_feasible": cost_pairs_inventory_feasible,
+                "merge_diagnostics_rows": cost_best.phase_statuses,
+                "route_pool_summary_rows": cost_route_pool_rows,
+                "balanced_route_pool_summary_rows": balanced_route_pool_rows,
+                "final_routes_with_flexible_units_on_big": cost_big_diagnostics["mixed_big_route_count"],
+                "final_flexible_units_on_big_routes": cost_big_diagnostics["mixed_big_flexible_unit_count"],
+                "final_piggyback_big_count": cost_big_diagnostics["piggyback_big_count"],
+                "final_promotion_like_big_count": cost_big_diagnostics["promotion_like_big_count"],
+                "final_blocking_big_flexible_count": cost_big_diagnostics["blocking_big_flexible_count"],
+                "final_blocking_big_flexible_unit_count": cost_big_diagnostics["blocking_big_flexible_unit_count"],
+                "route_pool_candidate_count": len(merged_route_pool_rows),
+                "route_pool_role_counts": dict(merged_role_counts),
                 "baseline_route_count": int(baseline_summary.get("route_count", baseline_reference_eval.route_count)),
                 "baseline_single_stop_route_count": int(
                     baseline_summary.get("single_stop_route_count", baseline_reference_eval.single_stop_route_count)
@@ -819,30 +1415,31 @@ class HybridQuestion1Solver(base.Question1Solver):
                     )
                 ),
                 "global_model_status": "hybrid_ok",
-                "global_phase_statuses": final_inner.phase_statuses,
+                "global_phase_statuses": cost_best.phase_statuses,
                 "global_selected_as_final": 1,
                 "global_validation_status": "hybrid_cost_improved" if cost_improved_vs_baseline else "hybrid_no_improvement",
-                "global_route_pool_candidate_count": final_inner.route_pool_candidate_count,
-                "global_final_total_cost": final_eval.total_cost,
-                "global_final_route_count": final_eval.route_count,
-                "global_final_single_stop_route_count": final_eval.single_stop_route_count,
-                "global_final_current_single_pairs_feasible": final_pairs_feasible,
-                "global_final_current_single_pairs_inventory_feasible": final_pairs_inventory_feasible,
-                "global_final_routes_with_flexible_units_on_big": final_big_diagnostics["mixed_big_route_count"],
-                "global_final_flexible_units_on_big_routes": final_big_diagnostics["mixed_big_flexible_unit_count"],
-                "global_final_piggyback_big_count": final_big_diagnostics["piggyback_big_count"],
-                "global_final_promotion_like_big_count": final_big_diagnostics["promotion_like_big_count"],
-                "global_final_blocking_big_flexible_count": final_big_diagnostics["blocking_big_flexible_count"],
-                "global_final_blocking_big_flexible_unit_count": final_big_diagnostics["blocking_big_flexible_unit_count"],
-                "global_fuel_3000_used_count": final_route_counts.get("fuel_3000", 0),
-                "global_fuel_3000_free_count": self._fuel_3000_free_count(final_route_counts),
+                "global_route_pool_candidate_count": len(merged_route_pool_rows),
+                "global_final_total_cost": cost_eval.total_cost,
+                "global_final_route_count": cost_eval.route_count,
+                "global_final_single_stop_route_count": cost_eval.single_stop_route_count,
+                "global_final_current_single_pairs_feasible": cost_pairs_feasible,
+                "global_final_current_single_pairs_inventory_feasible": cost_pairs_inventory_feasible,
+                "global_final_routes_with_flexible_units_on_big": cost_big_diagnostics["mixed_big_route_count"],
+                "global_final_flexible_units_on_big_routes": cost_big_diagnostics["mixed_big_flexible_unit_count"],
+                "global_final_piggyback_big_count": cost_big_diagnostics["piggyback_big_count"],
+                "global_final_promotion_like_big_count": cost_big_diagnostics["promotion_like_big_count"],
+                "global_final_blocking_big_flexible_count": cost_big_diagnostics["blocking_big_flexible_count"],
+                "global_final_blocking_big_flexible_unit_count": cost_big_diagnostics["blocking_big_flexible_unit_count"],
+                "global_fuel_3000_used_count": cost_route_counts.get("fuel_3000", 0),
+                "global_fuel_3000_free_count": self._fuel_3000_free_count(cost_route_counts),
                 "split_packing_sensitivity_executed": 0,
                 "split_packing_sensitivity_status": "not_run_hybrid",
                 "split_packing_sensitivity_total_cost": None,
                 "split_packing_sensitivity_route_count": None,
                 "split_packing_sensitivity_reference_total_cost": None,
                 "split_packing_sensitivity_reference_route_count": None,
-                "final_solution_source": f"hybrid_{final_inner.selected_label}",
+                "final_solution_source": f"hybrid_{cost_best.selected_label}",
+                "balanced_final_solution_source": f"hybrid_{balanced_best.selected_label}",
                 "hybrid_outer_seed": self.hybrid_seed,
                 "hybrid_mode": self.hybrid_mode,
                 "hybrid_generations_completed": generations_completed,
@@ -853,6 +1450,32 @@ class HybridQuestion1Solver(base.Question1Solver):
                 "hybrid_baseline_reference_total_cost": baseline_reference_eval.total_cost,
                 "hybrid_baseline_reference_route_count": baseline_reference_eval.route_count,
                 "hybrid_baseline_reference_single_stop_route_count": baseline_reference_eval.single_stop_route_count,
+                "cost_best_total_cost": cost_eval.total_cost,
+                "cost_best_route_count": cost_eval.route_count,
+                "cost_best_single_stop_route_count": cost_eval.single_stop_route_count,
+                "cost_best_late_positive_stops": cost_eval.late_positive_stops,
+                "cost_best_max_late_min": cost_eval.max_late_min,
+                "cost_best_total_late_min": cost_eval.total_late_min,
+                "cost_best_final_solution_source": f"hybrid_{cost_best.selected_label}",
+                "balanced_best_total_cost": balanced_eval.total_cost,
+                "balanced_best_route_count": balanced_eval.route_count,
+                "balanced_best_single_stop_route_count": balanced_eval.single_stop_route_count,
+                "balanced_best_late_positive_stops": balanced_eval.late_positive_stops,
+                "balanced_best_max_late_min": balanced_eval.max_late_min,
+                "balanced_best_total_late_min": balanced_eval.total_late_min,
+                "balanced_best_final_solution_source": f"hybrid_{balanced_best.selected_label}",
+                "archive_injected_route_count": max(
+                    int(cost_best.archive_injected_route_count),
+                    int(balanced_best.archive_injected_route_count),
+                ),
+                "archive_selected_column_count": cost_archive_selected_count,
+                "pheromone_bonus_selected_column_count": cost_pheromone_selected_count,
+                "cost_best_archive_selected_column_count": cost_archive_selected_count,
+                "cost_best_pheromone_bonus_selected_column_count": cost_pheromone_selected_count,
+                "balanced_best_archive_selected_column_count": balanced_archive_selected_count,
+                "balanced_best_pheromone_bonus_selected_column_count": balanced_pheromone_selected_count,
+                "cluster_remove_attempt_count": self.cluster_remove_attempt_count,
+                "cluster_remove_accepted_count": self.cluster_remove_accepted_count,
             }
         )
         return metadata
@@ -917,29 +1540,42 @@ class HybridQuestion1Solver(base.Question1Solver):
 
     def _write_compare_to_baseline(
         self,
-        final_eval: base.SolutionEvaluation,
+        cost_best: HybridInnerResult,
+        balanced_best: HybridInnerResult,
         metadata: dict[str, object],
     ) -> None:
         baseline_summary = self.baseline_summary
         compare_payload = {
             "baseline_total_cost": float(baseline_summary.get("total_cost", metadata["baseline_total_cost"])),
-            "hybrid_total_cost": float(final_eval.total_cost),
+            "hybrid_total_cost": float(cost_best.solution_eval.total_cost),
             "baseline_route_count": int(baseline_summary.get("route_count", metadata["baseline_route_count"])),
-            "hybrid_route_count": int(final_eval.route_count),
+            "hybrid_route_count": int(cost_best.solution_eval.route_count),
             "baseline_single_stop_route_count": int(
                 baseline_summary.get("single_stop_route_count", metadata["baseline_single_stop_route_count"])
             ),
-            "hybrid_single_stop_route_count": int(final_eval.single_stop_route_count),
+            "hybrid_single_stop_route_count": int(cost_best.solution_eval.single_stop_route_count),
             "baseline_late_positive_stops": int(
                 baseline_summary.get("late_positive_stops", baseline_summary.get("late_positive_stop_count", 0))
             ),
-            "hybrid_late_positive_stops": int(final_eval.late_positive_stops),
+            "hybrid_late_positive_stops": int(cost_best.solution_eval.late_positive_stops),
             "baseline_max_late_min": float(baseline_summary.get("max_late_min", 0.0)),
-            "hybrid_max_late_min": float(final_eval.max_late_min),
+            "hybrid_max_late_min": float(cost_best.solution_eval.max_late_min),
             "baseline_vehicle_type_usage": baseline_summary.get("vehicle_type_usage", {}),
-            "hybrid_vehicle_type_usage": final_eval.vehicle_type_usage,
+            "hybrid_vehicle_type_usage": cost_best.solution_eval.vehicle_type_usage,
             "baseline_final_solution_source": baseline_summary.get("final_solution_source", "baseline"),
             "hybrid_final_solution_source": metadata["final_solution_source"],
+            "cost_best_total_cost": float(cost_best.solution_eval.total_cost),
+            "cost_best_route_count": int(cost_best.solution_eval.route_count),
+            "cost_best_single_stop_route_count": int(cost_best.solution_eval.single_stop_route_count),
+            "cost_best_late_positive_stops": int(cost_best.solution_eval.late_positive_stops),
+            "cost_best_max_late_min": float(cost_best.solution_eval.max_late_min),
+            "cost_best_final_solution_source": metadata["final_solution_source"],
+            "balanced_best_total_cost": float(balanced_best.solution_eval.total_cost),
+            "balanced_best_route_count": int(balanced_best.solution_eval.route_count),
+            "balanced_best_single_stop_route_count": int(balanced_best.solution_eval.single_stop_route_count),
+            "balanced_best_late_positive_stops": int(balanced_best.solution_eval.late_positive_stops),
+            "balanced_best_max_late_min": float(balanced_best.solution_eval.max_late_min),
+            "balanced_best_final_solution_source": metadata["balanced_final_solution_source"],
         }
         (self.output_root / "q1_hybrid_compare_to_baseline.json").write_text(
             json.dumps(compare_payload, indent=2, ensure_ascii=False),
@@ -948,7 +1584,8 @@ class HybridQuestion1Solver(base.Question1Solver):
 
     def _augment_hybrid_cost_summary_and_report(
         self,
-        final_eval: base.SolutionEvaluation,
+        cost_best: HybridInnerResult,
+        balanced_best: HybridInnerResult,
         metadata: dict[str, object],
     ) -> None:
         cost_summary_path = self.output_root / "q1_hybrid_cost_summary.json"
@@ -967,6 +1604,22 @@ class HybridQuestion1Solver(base.Question1Solver):
                     "hybrid_baseline_reference_total_cost": metadata["hybrid_baseline_reference_total_cost"],
                     "hybrid_baseline_reference_route_count": metadata["hybrid_baseline_reference_route_count"],
                     "hybrid_baseline_reference_single_stop_route_count": metadata["hybrid_baseline_reference_single_stop_route_count"],
+                    "cost_best_total_cost": metadata["cost_best_total_cost"],
+                    "cost_best_route_count": metadata["cost_best_route_count"],
+                    "cost_best_single_stop_route_count": metadata["cost_best_single_stop_route_count"],
+                    "cost_best_late_positive_stops": metadata["cost_best_late_positive_stops"],
+                    "cost_best_max_late_min": metadata["cost_best_max_late_min"],
+                    "balanced_best_total_cost": metadata["balanced_best_total_cost"],
+                    "balanced_best_route_count": metadata["balanced_best_route_count"],
+                    "balanced_best_single_stop_route_count": metadata["balanced_best_single_stop_route_count"],
+                    "balanced_best_late_positive_stops": metadata["balanced_best_late_positive_stops"],
+                    "balanced_best_max_late_min": metadata["balanced_best_max_late_min"],
+                    "archive_injected_route_count": metadata["archive_injected_route_count"],
+                    "archive_selected_column_count": metadata["archive_selected_column_count"],
+                    "pheromone_bonus_selected_column_count": metadata["pheromone_bonus_selected_column_count"],
+                    "cluster_remove_attempt_count": metadata["cluster_remove_attempt_count"],
+                    "cluster_remove_accepted_count": metadata["cluster_remove_accepted_count"],
+                    "balanced_final_solution_source": metadata["balanced_final_solution_source"],
                 }
             )
             cost_summary_path.write_text(json.dumps(cost_summary, indent=2, ensure_ascii=False), encoding="utf-8")
@@ -986,25 +1639,62 @@ class HybridQuestion1Solver(base.Question1Solver):
                     f"{metadata['hybrid_baseline_reference_total_cost']:.3f}/"
                     f"{metadata['hybrid_baseline_reference_route_count']}/"
                     f"{metadata['hybrid_baseline_reference_single_stop_route_count']}",
-                    f"- Hybrid final total cost/route count/single-stop: "
-                    f"{final_eval.total_cost:.3f}/{final_eval.route_count}/{final_eval.single_stop_route_count}",
+                    f"- Cost best total cost/route count/single-stop/late+/maxlate: "
+                    f"{cost_best.solution_eval.total_cost:.3f}/{cost_best.solution_eval.route_count}/"
+                    f"{cost_best.solution_eval.single_stop_route_count}/{cost_best.solution_eval.late_positive_stops}/"
+                    f"{cost_best.solution_eval.max_late_min:.3f}",
+                    f"- Balanced best total cost/route count/single-stop/late+/maxlate: "
+                    f"{balanced_best.solution_eval.total_cost:.3f}/{balanced_best.solution_eval.route_count}/"
+                    f"{balanced_best.solution_eval.single_stop_route_count}/{balanced_best.solution_eval.late_positive_stops}/"
+                    f"{balanced_best.solution_eval.max_late_min:.3f}",
+                    f"- Archive injected route count: {metadata['archive_injected_route_count']}",
+                    f"- Archive/pheromone selected column count: "
+                    f"{metadata['archive_selected_column_count']}/{metadata['pheromone_bonus_selected_column_count']}",
+                    f"- Cluster remove attempts/accepted: "
+                    f"{metadata['cluster_remove_attempt_count']}/{metadata['cluster_remove_accepted_count']}",
                 ]
             )
             report_path.write_text("\n".join(report_lines), encoding="utf-8")
 
-    def _write_hybrid_outputs(
+    def _write_single_hybrid_bundle(
         self,
-        final_eval: base.SolutionEvaluation,
-        final_routes: list[base.TypedRoute],
+        output_root: Path,
+        inner_result: HybridInnerResult,
         metadata: dict[str, object],
     ) -> None:
-        self.output_root.mkdir(parents=True, exist_ok=True)
-        super()._write_outputs(final_eval, final_routes, metadata)
-        self._rename_base_outputs()
+        original_output_root = self.output_root
+        try:
+            self.output_root = output_root
+            self.output_root.mkdir(parents=True, exist_ok=True)
+            super()._write_outputs(inner_result.solution_eval, inner_result.routes, metadata)
+            self._rename_base_outputs()
+        finally:
+            self.output_root = original_output_root
+
+    def _write_hybrid_outputs(
+        self,
+        cost_best: HybridInnerResult,
+        balanced_best: HybridInnerResult,
+        metadata: dict[str, object],
+    ) -> None:
+        cost_metadata = self._result_specific_metadata(
+            metadata=metadata,
+            inner_result=cost_best,
+            route_pool_rows=list(metadata["route_pool_summary_rows"]),
+            final_source_name=str(metadata["final_solution_source"]),
+        )
+        balanced_metadata = self._result_specific_metadata(
+            metadata=metadata,
+            inner_result=balanced_best,
+            route_pool_rows=list(metadata.get("balanced_route_pool_summary_rows", metadata["route_pool_summary_rows"])),
+            final_source_name=str(metadata["balanced_final_solution_source"]),
+        )
+        self._write_single_hybrid_bundle(self.output_root, cost_best, cost_metadata)
         self._write_outer_search_trace()
         self._write_pheromone_top_edges()
-        self._write_compare_to_baseline(final_eval, metadata)
-        self._augment_hybrid_cost_summary_and_report(final_eval, metadata)
+        self._write_compare_to_baseline(cost_best, balanced_best, metadata)
+        self._augment_hybrid_cost_summary_and_report(cost_best, balanced_best, metadata)
+        self._write_single_hybrid_bundle(self.output_root / "balanced", balanced_best, balanced_metadata)
 
     def solve(self) -> tuple[base.SolutionEvaluation, dict[str, object]]:
         search_start = time.perf_counter()
@@ -1018,16 +1708,25 @@ class HybridQuestion1Solver(base.Question1Solver):
             route_pool_candidate_count=int(baseline_reference_metadata.get("route_pool_candidate_count", 0)),
             route_pool_role_counts=dict(baseline_reference_metadata.get("route_pool_role_counts", {})),
             summary_by_label={},
+            archive_injected_route_count=0,
+            selected_route_keys={self._route_key(route) for route in baseline_reference_routes},
         )
-        global_best = baseline_inner
-        self._update_elite_archive(global_best.routes, global_best.solution_eval, global_best.selected_label)
-        self._deposit_solution_pheromone(global_best.routes, global_best.solution_eval, multiplier=1.0)
+        global_best_cost = baseline_inner
+        self._register_observed_result(baseline_inner)
+        global_best_balanced = self._select_balanced_best(global_best_cost)
+        self._update_elite_archive(global_best_cost.routes, global_best_cost.solution_eval, global_best_cost.selected_label)
+        self._deposit_solution_pheromone(global_best_cost.routes, global_best_cost.solution_eval, multiplier=1.0)
 
         master_rng = random.Random(self.hybrid_seed)
         particles: list[HybridParticle] = []
         for particle_id in range(self.particle_count):
             particle_rng = random.Random(master_rng.randint(1, 10**9))
-            gbest_features = self._extract_solution_feature_sets(global_best.routes)
+            gbest_cost_features = self._extract_solution_feature_sets(global_best_cost.routes)
+            gbest_balanced_features = self._extract_solution_feature_sets(global_best_balanced.routes)
+            gbest_features = (
+                gbest_cost_features[0] | gbest_balanced_features[0],
+                gbest_cost_features[1] | gbest_balanced_features[1],
+            )
             candidate_routes = self._build_probabilistic_initial_solution(
                 rng=particle_rng,
                 temperature=1.0,
@@ -1037,20 +1736,24 @@ class HybridQuestion1Solver(base.Question1Solver):
             inner_result = self._inner_refine_solution(candidate_routes)
             if inner_result is None:
                 inner_result = baseline_inner
+            self._register_observed_result(inner_result)
+            if self._is_outer_better(inner_result.solution_eval, global_best_cost.solution_eval):
+                global_best_cost = inner_result
+            global_best_balanced = self._select_balanced_best(global_best_cost)
             particle = HybridParticle(
                 particle_id=particle_id,
                 current_routes=self._clone_routes(inner_result.routes),
                 current_eval=inner_result.solution_eval,
                 personal_best_routes=self._clone_routes(inner_result.routes),
                 personal_best_eval=inner_result.solution_eval,
+                personal_balanced_best_routes=self._clone_routes(inner_result.routes),
+                personal_balanced_best_eval=inner_result.solution_eval,
                 destroy_ratio=0.12 + 0.02 * particle_id,
                 construction_temperature=1.0,
-                operator_weights=self._normalize_operator_weights({name: 1.0 for name in OUTER_OPERATOR_NAMES}),
+                operator_weights=self._initial_operator_weights(),
                 cauchy_scale=HYBRID_CAUCHY_GAMMA0,
             )
             particles.append(particle)
-            if self._is_outer_better(inner_result.solution_eval, global_best.solution_eval):
-                global_best = inner_result
             self._update_elite_archive(inner_result.routes, inner_result.solution_eval, f"init_particle_{particle_id}")
             self.outer_search_trace_rows.append(
                 {
@@ -1064,9 +1767,15 @@ class HybridQuestion1Solver(base.Question1Solver):
                     "candidate_route_count": inner_result.solution_eval.route_count,
                     "candidate_single_stop_route_count": inner_result.solution_eval.single_stop_route_count,
                     "candidate_label": inner_result.selected_label,
+                    "candidate_is_balanced_best": int(
+                        self._route_signature(inner_result.routes) == self._route_signature(global_best_balanced.routes)
+                    ),
+                    "archive_injected_route_count": int(inner_result.archive_injected_route_count),
                     "accepted_current": 1,
                     "accepted_pbest": 1,
-                    "accepted_gbest": int(inner_result.solution_eval is global_best.solution_eval),
+                    "accepted_gbest": int(
+                        self._route_signature(inner_result.routes) == self._route_signature(global_best_cost.routes)
+                    ),
                 }
             )
 
@@ -1077,7 +1786,12 @@ class HybridQuestion1Solver(base.Question1Solver):
             for particle in particles:
                 particle_rng = random.Random(master_rng.randint(1, 10**9))
                 self._mutate_particle_parameters(particle, generation, particle_rng)
-                source_mode, source_routes, source_eval = self._choose_source_solution(particle, global_best, particle_rng)
+                source_mode, source_routes, source_eval = self._choose_source_solution(
+                    particle,
+                    global_best_cost,
+                    global_best_balanced,
+                    particle_rng,
+                )
                 partial_routes, removed_units, operator_name = self._destroy_solution(
                     routes=source_routes,
                     solution_eval=source_eval,
@@ -1086,7 +1800,12 @@ class HybridQuestion1Solver(base.Question1Solver):
                     rng=particle_rng,
                 )
                 pbest_features = self._extract_solution_feature_sets(particle.personal_best_routes)
-                gbest_features = self._extract_solution_feature_sets(global_best.routes)
+                gbest_cost_features = self._extract_solution_feature_sets(global_best_cost.routes)
+                gbest_balanced_features = self._extract_solution_feature_sets(global_best_balanced.routes)
+                gbest_features = (
+                    gbest_cost_features[0] | gbest_balanced_features[0],
+                    gbest_cost_features[1] | gbest_balanced_features[1],
+                )
                 repaired_routes = self._repair_solution_probabilistic(
                     partial_routes=partial_routes,
                     removed_units=removed_units,
@@ -1098,17 +1817,23 @@ class HybridQuestion1Solver(base.Question1Solver):
                 accepted_current = 0
                 accepted_pbest = 0
                 accepted_gbest = 0
+                accepted_balanced = 0
                 candidate_total_cost = None
                 candidate_route_count = None
                 candidate_single_stop_route_count = None
                 candidate_label = None
+                archive_injected_route_count = 0
+                candidate_is_balanced_best = 0
                 if repaired_routes is not None:
                     inner_result = self._inner_refine_solution(repaired_routes)
                     if inner_result is not None:
+                        previous_balanced_signature = self._route_signature(global_best_balanced.routes)
+                        self._register_observed_result(inner_result)
                         candidate_total_cost = round(inner_result.solution_eval.total_cost, 6)
                         candidate_route_count = inner_result.solution_eval.route_count
                         candidate_single_stop_route_count = inner_result.solution_eval.single_stop_route_count
                         candidate_label = inner_result.selected_label
+                        archive_injected_route_count = int(inner_result.archive_injected_route_count)
                         if self._is_outer_better(inner_result.solution_eval, particle.current_eval):
                             particle.current_routes = self._clone_routes(inner_result.routes)
                             particle.current_eval = inner_result.solution_eval
@@ -1123,8 +1848,15 @@ class HybridQuestion1Solver(base.Question1Solver):
                                 inner_result.solution_eval,
                                 f"particle_{particle.particle_id}_gen_{generation}",
                             )
-                        if self._is_outer_better(inner_result.solution_eval, global_best.solution_eval):
-                            global_best = inner_result
+                        if self._is_balanced_better(
+                            inner_result.solution_eval,
+                            particle.personal_balanced_best_eval,
+                            global_best_cost.solution_eval,
+                        ):
+                            particle.personal_balanced_best_routes = self._clone_routes(inner_result.routes)
+                            particle.personal_balanced_best_eval = inner_result.solution_eval
+                        if self._is_outer_better(inner_result.solution_eval, global_best_cost.solution_eval):
+                            global_best_cost = inner_result
                             accepted_gbest = 1
                             generation_improved = True
                             self._update_elite_archive(
@@ -1132,6 +1864,26 @@ class HybridQuestion1Solver(base.Question1Solver):
                                 inner_result.solution_eval,
                                 f"global_best_gen_{generation}",
                             )
+                        global_best_balanced = self._select_balanced_best(global_best_cost)
+                        candidate_is_balanced_best = int(
+                            self._route_signature(inner_result.routes)
+                            == self._route_signature(global_best_balanced.routes)
+                        )
+                        accepted_balanced = int(
+                            self._route_signature(global_best_balanced.routes) != previous_balanced_signature
+                            and candidate_is_balanced_best == 1
+                        )
+                        if accepted_balanced:
+                            generation_improved = True
+                            self._update_elite_archive(
+                                inner_result.routes,
+                                inner_result.solution_eval,
+                                f"balanced_best_gen_{generation}",
+                            )
+                        if operator_name == "cluster_remove" and (
+                            accepted_current or accepted_pbest or accepted_gbest or accepted_balanced
+                        ):
+                            self.cluster_remove_accepted_count += 1
                 self.outer_search_trace_rows.append(
                     {
                         "generation": generation,
@@ -1144,13 +1896,15 @@ class HybridQuestion1Solver(base.Question1Solver):
                         "candidate_route_count": candidate_route_count,
                         "candidate_single_stop_route_count": candidate_single_stop_route_count,
                         "candidate_label": candidate_label,
+                        "candidate_is_balanced_best": candidate_is_balanced_best,
+                        "archive_injected_route_count": archive_injected_route_count,
                         "accepted_current": accepted_current,
                         "accepted_pbest": accepted_pbest,
                         "accepted_gbest": accepted_gbest,
                     }
                 )
             generations_completed = generation
-            self._update_pheromones(particles, global_best)
+            self._update_pheromones(particles, global_best_cost, global_best_balanced)
             if generation_improved:
                 stagnant_generations = 0
             else:
@@ -1160,15 +1914,16 @@ class HybridQuestion1Solver(base.Question1Solver):
 
         elapsed_sec = time.perf_counter() - search_start
         final_metadata = self._build_hybrid_metadata(
-            final_inner=global_best,
+            cost_best=global_best_cost,
+            balanced_best=global_best_balanced,
             baseline_reference_eval=baseline_reference_eval,
             baseline_reference_routes=baseline_reference_routes,
             baseline_reference_metadata=baseline_reference_metadata,
             elapsed_sec=elapsed_sec,
             generations_completed=generations_completed,
         )
-        self._write_hybrid_outputs(global_best.solution_eval, global_best.routes, final_metadata)
-        return global_best.solution_eval, final_metadata
+        self._write_hybrid_outputs(global_best_cost, global_best_balanced, final_metadata)
+        return global_best_cost.solution_eval, final_metadata
 
 
 def parse_args() -> argparse.Namespace:
@@ -1215,6 +1970,9 @@ def main() -> None:
                 "split_customer_count": best_solution.split_customer_count,
                 "late_positive_stops": best_solution.late_positive_stops,
                 "max_late_min": best_solution.max_late_min,
+                "balanced_best_total_cost": metadata["balanced_best_total_cost"],
+                "balanced_best_late_positive_stops": metadata["balanced_best_late_positive_stops"],
+                "balanced_best_max_late_min": metadata["balanced_best_max_late_min"],
                 "hybrid_outer_seed": metadata["hybrid_outer_seed"],
                 "hybrid_mode": metadata["hybrid_mode"],
                 "hybrid_generations_completed": metadata["hybrid_generations_completed"],

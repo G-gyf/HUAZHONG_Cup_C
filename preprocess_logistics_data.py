@@ -39,8 +39,8 @@ SPEED_SEGMENTS: tuple[SpeedSegment, ...] = (
     SpeedSegment(5, "free_flow", 300, 420, 55.3),
     SpeedSegment(6, "normal", 420, 540, 35.4),
     SpeedSegment(7, "congested", 540, 630, 9.8),
-    SpeedSegment(8, "normal", 630, 720, 35.4),
-    SpeedSegment(9, "free_flow", 720, 780, 55.3),
+    SpeedSegment(8, "free_flow", 630, 720, 55.3),
+    SpeedSegment(9, "normal", 720, 780, 35.4),
 )
 
 

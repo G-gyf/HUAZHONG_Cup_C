@@ -56,17 +56,17 @@
     },
     {
       "segment_id": 8,
-      "traffic_state": "normal",
+      "traffic_state": "free_flow",
       "start_min": 630,
       "end_min": 720,
-      "speed_kmh": 35.4
+      "speed_kmh": 55.3
     },
     {
       "segment_id": 9,
-      "traffic_state": "free_flow",
+      "traffic_state": "normal",
       "start_min": 720,
       "end_min": 780,
-      "speed_kmh": 55.3
+      "speed_kmh": 35.4
     }
   ],
   "vehicle_capacity_reference": [

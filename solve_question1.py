@@ -3714,7 +3714,7 @@ class Question1Solver:
         solution_eval: SolutionEvaluation,
         generation: int,
         rng: random.Random,
-    ) -> tuple[list[TypedRoute] | None, SolutionEvaluation | None, str]:
+    ) -> tuple[list[TypedRoute] | None, SolutionEvaluation | None, str, dict[str, int]]:
         q_remove = self._compute_remove_count(generation, rng)
         draw = rng.random()
         if draw < 0.2:
@@ -3734,10 +3734,14 @@ class Question1Solver:
             partial_routes, removed = self._mandatory_split_cluster_remove(solution_eval, q_remove, rng)
         repaired = self.repair_solution(partial_routes, removed)
         if repaired is None:
-            return None, None, operator_name
-        improved, _ = self.improve_solution(repaired)
+            return None, None, operator_name, {
+                "route_merge_success_count": 0,
+                "relocate_success_count": 0,
+                "route_type_change_success_count": 0,
+            }
+        improved, improve_stats = self.improve_solution(repaired)
         evaluated = self.evaluate_solution(improved)
-        return improved, evaluated, operator_name
+        return improved, evaluated, operator_name, improve_stats
 
     def _solve_single_configuration(self) -> tuple[SolutionEvaluation, list[TypedRoute], dict[str, object]]:
         self.output_root.mkdir(parents=True, exist_ok=True)
@@ -3745,67 +3749,119 @@ class Question1Solver:
         best_solution_routes: list[TypedRoute] | None = None
         best_seed = None
         run_records: list[dict[str, object]] = []
-        best_operator_stats = {
-            "route_merge_success_count": 0,
-            "relocate_success_count": 0,
-            "route_type_change_success_count": 0,
-        }
-        search_start = time.perf_counter()
 
-        for seed in self.seed_list:
-            rng = random.Random(seed)
-            seed_best_routes: list[TypedRoute] | None = None
-            seed_best_eval: SolutionEvaluation | None = None
-            seed_best_stats = {
+        def empty_operator_stats() -> dict[str, int]:
+            return {
                 "route_merge_success_count": 0,
                 "relocate_success_count": 0,
                 "route_type_change_success_count": 0,
             }
-            for _ in range(self.particle_count):
+
+        def is_better(candidate_eval: SolutionEvaluation, reference_eval: SolutionEvaluation | None) -> bool:
+            return reference_eval is None or self._solution_rank_key(candidate_eval) < self._solution_rank_key(reference_eval)
+
+        best_operator_stats = empty_operator_stats()
+        search_start = time.perf_counter()
+
+        for seed in self.seed_list:
+            rng = random.Random(seed)
+            particles: list[dict[str, object]] = []
+            seed_best_routes: list[TypedRoute] | None = None
+            seed_best_eval: SolutionEvaluation | None = None
+            seed_best_stats = empty_operator_stats()
+            seed_record = {
+                "seed": seed,
+                "initial_feasible_particle_count": 0,
+                "mutation_attempt_count": 0,
+                "accepted_mutation_count": 0,
+                "best_update_count": 0,
+                "operator_usage": Counter[str](),
+            }
+            for particle_idx in range(self.particle_count):
                 candidate = self._build_initial_solution(rng)
                 candidate, candidate_stats = self.improve_solution(candidate)
                 evaluated = self.evaluate_solution(candidate)
                 if evaluated is None:
                     continue
-                if seed_best_eval is None or self._solution_rank_key(evaluated) < self._solution_rank_key(seed_best_eval):
+                particles.append(
+                    {
+                        "particle_index": particle_idx,
+                        "current_routes": candidate,
+                        "current_eval": evaluated,
+                        "best_routes": candidate,
+                        "best_eval": evaluated,
+                        "stats": dict(candidate_stats),
+                        "best_stats": dict(candidate_stats),
+                    }
+                )
+                seed_record["initial_feasible_particle_count"] += 1
+                if is_better(evaluated, seed_best_eval):
                     seed_best_routes = candidate
                     seed_best_eval = evaluated
                     seed_best_stats = dict(candidate_stats)
+                    seed_record["best_update_count"] += 1
 
-            if seed_best_eval is None or seed_best_routes is None:
+            if seed_best_eval is None or seed_best_routes is None or not particles:
                 continue
-            seed_incumbent_eval = seed_best_eval
-            if best_solution_eval is None or self._solution_rank_key(seed_best_eval) < self._solution_rank_key(best_solution_eval):
+            if is_better(seed_best_eval, best_solution_eval):
                 best_solution_eval = seed_best_eval
                 best_solution_routes = seed_best_routes
                 best_seed = seed
                 best_operator_stats = dict(seed_best_stats)
 
-            for _ in range(max(self.max_generations - 1, 0)):
-                refined_routes, refined_stats = self.improve_solution(seed_best_routes)
-                refined_eval = self.evaluate_solution(refined_routes)
-                if refined_eval is None or self._solution_rank_key(refined_eval) >= self._solution_rank_key(seed_incumbent_eval):
-                    break
-                seed_best_routes = refined_routes
-                seed_incumbent_eval = refined_eval
-                for key, value in refined_stats.items():
-                    seed_best_stats[key] += value
-                if best_solution_eval is None or self._solution_rank_key(refined_eval) < self._solution_rank_key(best_solution_eval):
-                    best_solution_eval = refined_eval
-                    best_solution_routes = refined_routes
-                    best_seed = seed
-                    best_operator_stats = dict(seed_best_stats)
+            # Evolve each particle with stochastic destroy/repair so larger budgets
+            # actually expand the explored neighborhood instead of repeating the same
+            # deterministic local refinement.
+            for generation in range(1, max(self.max_generations, 1)):
+                particle_visit_order = list(range(len(particles)))
+                rng.shuffle(particle_visit_order)
+                for particle_pos in particle_visit_order:
+                    particle = particles[particle_pos]
+                    seed_record["mutation_attempt_count"] += 1
+                    mutated_routes, mutated_eval, operator_name, mutation_stats = self._mutate_particle(
+                        particle["current_routes"],
+                        particle["current_eval"],
+                        generation,
+                        rng,
+                    )
+                    if mutated_routes is None or mutated_eval is None:
+                        continue
+                    seed_record["accepted_mutation_count"] += 1
+                    seed_record["operator_usage"][operator_name] += 1
+                    particle["current_routes"] = mutated_routes
+                    particle["current_eval"] = mutated_eval
+                    for key, value in mutation_stats.items():
+                        particle["stats"][key] += value
+                    if is_better(mutated_eval, particle["best_eval"]):
+                        particle["best_routes"] = mutated_routes
+                        particle["best_eval"] = mutated_eval
+                        particle["best_stats"] = dict(particle["stats"])
+                        seed_record["best_update_count"] += 1
+                    if is_better(particle["best_eval"], seed_best_eval):
+                        seed_best_routes = particle["best_routes"]
+                        seed_best_eval = particle["best_eval"]
+                        seed_best_stats = dict(particle["best_stats"])
+                    if is_better(particle["best_eval"], best_solution_eval):
+                        best_solution_eval = particle["best_eval"]
+                        best_solution_routes = particle["best_routes"]
+                        best_seed = seed
+                        best_operator_stats = dict(particle["best_stats"])
 
             run_records.append(
                 {
                     "seed": seed,
-                    "best_cost": seed_incumbent_eval.total_cost,
-                    "route_count": seed_incumbent_eval.route_count,
-                    "used_vehicle_count": seed_incumbent_eval.used_vehicle_count,
-                    "split_customer_count": seed_incumbent_eval.split_customer_count,
-                    "single_stop_route_count": seed_incumbent_eval.single_stop_route_count,
-                    "late_positive_stops": seed_incumbent_eval.late_positive_stops,
-                    "latest_return_min": seed_incumbent_eval.latest_return_min,
+                    "best_cost": seed_best_eval.total_cost,
+                    "route_count": seed_best_eval.route_count,
+                    "used_vehicle_count": seed_best_eval.used_vehicle_count,
+                    "split_customer_count": seed_best_eval.split_customer_count,
+                    "single_stop_route_count": seed_best_eval.single_stop_route_count,
+                    "late_positive_stops": seed_best_eval.late_positive_stops,
+                    "latest_return_min": seed_best_eval.latest_return_min,
+                    "initial_feasible_particle_count": seed_record["initial_feasible_particle_count"],
+                    "mutation_attempt_count": seed_record["mutation_attempt_count"],
+                    "accepted_mutation_count": seed_record["accepted_mutation_count"],
+                    "best_update_count": seed_record["best_update_count"],
+                    "operator_usage": dict(seed_record["operator_usage"]),
                 }
             )
 
@@ -3974,6 +4030,15 @@ class Question1Solver:
             "best_seed": best_seed,
             "elapsed_sec": elapsed_sec,
             "run_records": run_records,
+            "seed_list": list(self.seed_list),
+            "seed_count": len(self.seed_list),
+            "particle_count": self.particle_count,
+            "max_generations": self.max_generations,
+            "top_route_candidates": self.top_route_candidates,
+            "run_record_count": len(run_records),
+            "total_mutation_attempt_count": sum(int(item["mutation_attempt_count"]) for item in run_records),
+            "total_accepted_mutation_count": sum(int(item["accepted_mutation_count"]) for item in run_records),
+            "total_best_update_count": sum(int(item["best_update_count"]) for item in run_records),
             "packing_strategy": self.packing_strategy,
             "route_pool_iteration_count": COST_FIRST_ROUTE_POOL_ITERATIONS,
             "cost_first_improved": int(cost_first_improved),
@@ -4417,6 +4482,16 @@ class Question1Solver:
             "relocate_success_count": metadata["relocate_success_count"],
             "route_type_change_success_count": metadata["route_type_change_success_count"],
             "best_seed": metadata["best_seed"],
+            "seed_list": metadata["seed_list"],
+            "seed_count": metadata["seed_count"],
+            "particle_count": metadata["particle_count"],
+            "max_generations": metadata["max_generations"],
+            "top_route_candidates": metadata["top_route_candidates"],
+            "run_record_count": metadata["run_record_count"],
+            "total_mutation_attempt_count": metadata["total_mutation_attempt_count"],
+            "total_accepted_mutation_count": metadata["total_accepted_mutation_count"],
+            "total_best_update_count": metadata["total_best_update_count"],
+            "run_records": metadata["run_records"],
             "service_unit_count": metadata["service_unit_count"],
             "route_cache_size": metadata["route_cache_size"],
             "elapsed_sec": metadata["elapsed_sec"],
@@ -4438,6 +4513,13 @@ class Question1Solver:
             "",
             "## Run Summary",
             f"- Best seed: {metadata['best_seed']}",
+            f"- Seed count: {metadata['seed_count']}",
+            f"- Particle count per seed: {metadata['particle_count']}",
+            f"- Max generations: {metadata['max_generations']}",
+            f"- Top route candidates: {metadata['top_route_candidates']}",
+            f"- Run record count: {metadata['run_record_count']}",
+            f"- Mutation attempts/accepted/best updates: {metadata['total_mutation_attempt_count']}/"
+            f"{metadata['total_accepted_mutation_count']}/{metadata['total_best_update_count']}",
             f"- Service unit count: {metadata['service_unit_count']}",
             f"- Packing strategy: {metadata['packing_strategy']}",
             f"- Cost-first improved: {metadata['cost_first_improved']}",
@@ -4575,7 +4657,11 @@ class Question1Solver:
                 f"- Seed {item['seed']}: best cost {item['best_cost']:.3f}, routes {item['route_count']}, "
                 f"vehicles {item['used_vehicle_count']}, split customers {item['split_customer_count']}, "
                 f"single-stop routes {item['single_stop_route_count']}, "
-                f"late-positive stops {item['late_positive_stops']}, latest return {item['latest_return_min']:.3f}"
+                f"feasible particles {item['initial_feasible_particle_count']}, "
+                f"mutations attempted/accepted/best updates "
+                f"{item['mutation_attempt_count']}/{item['accepted_mutation_count']}/{item['best_update_count']}, "
+                f"late-positive stops {item['late_positive_stops']}, latest return {item['latest_return_min']:.3f}, "
+                f"operators {json.dumps(item['operator_usage'], ensure_ascii=False)}"
             )
         (self.output_root / "q1_run_report.md").write_text("\n".join(report_lines), encoding="utf-8")
 
@@ -4615,6 +4701,12 @@ def main() -> None:
                 "late_positive_stops": best_solution.late_positive_stops,
                 "latest_return_min": best_solution.latest_return_min,
                 "best_seed": metadata["best_seed"],
+                "seed_count": metadata["seed_count"],
+                "particle_count": metadata["particle_count"],
+                "max_generations": metadata["max_generations"],
+                "run_record_count": metadata["run_record_count"],
+                "total_mutation_attempt_count": metadata["total_mutation_attempt_count"],
+                "total_accepted_mutation_count": metadata["total_accepted_mutation_count"],
                 "elapsed_sec": metadata["elapsed_sec"],
                 "output_root": str(args.output_root),
             },

@@ -1,0 +1,3 @@
+﻿phase,stage,status,fallback_used,selected_route_count,objective_value,pass_label,big_route_bound_mode
+cost_first_total_cost,cost_first,optimal,0,132,87452.8964402223,pass1,
+cost_first_total_cost,cost_first,optimal,0,132,87452.8964402223,pass2,

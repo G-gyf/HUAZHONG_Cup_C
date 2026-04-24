@@ -1,0 +1,17 @@
+﻿generation,particle_id,source_mode,operator_name,destroy_ratio,construction_temperature,candidate_total_cost,candidate_route_count,candidate_single_stop_route_count,candidate_label,accepted_current,accepted_pbest,accepted_gbest
+0,0,construct,construct,0.12,1.0,88183.287684,132.0,95.0,pass2,1,1,0
+0,1,construct,construct,0.14,1.0,88365.002735,133.0,95.0,pass2,1,1,0
+0,2,construct,construct,0.16,1.0,88335.568152,133.0,97.0,pass2,1,1,0
+0,3,construct,construct,0.18,1.0,88191.607851,132.0,95.0,pass2,1,1,0
+1,0,current,worst_cost_remove,0.147205,1.126395,87637.856478,131.0,94.0,pass2,1,1,0
+1,1,personal_best,typed_route_merge_remove,0.147587,1.03375,88365.002735,133.0,95.0,pass1,0,0,0
+1,2,personal_best,typed_route_merge_remove,0.143276,0.929444,87921.898396,132.0,95.0,pass1,1,1,0
+1,3,personal_best,mandatory_split_cluster_remove,0.177163,0.987665,88316.561744,132.0,95.0,pass2,0,0,0
+2,0,personal_best,typed_route_merge_remove,0.156956,1.175489,87637.856478,131.0,94.0,pass1,0,0,0
+2,1,current,worst_cost_remove,0.118509,0.91026,87983.813059,132.0,94.0,pass1,1,1,0
+2,2,personal_best,typed_route_merge_remove,0.151949,0.965392,87921.898396,132.0,95.0,pass1,0,0,0
+2,3,global_best,mandatory_split_cluster_remove,0.18222,1.009758,87795.786901,132.0,95.0,pass2,1,1,0
+3,0,current,worst_cost_remove,0.151199,1.146248,87637.856478,131.0,94.0,candidate,0,0,0
+3,1,global_best,typed_route_merge_remove,0.098012,0.832187,87616.609799,132.0,97.0,pass1,1,1,0
+3,2,current,random_remove,0.119714,0.838406,,,,,0,0,0
+3,3,global_best,late_route_remove,0.207268,1.126704,87452.89644,132.0,96.0,pass1,1,1,1

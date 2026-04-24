@@ -7,6 +7,7 @@ import random
 import time
 from collections import Counter, defaultdict
 from dataclasses import dataclass
+from itertools import combinations, permutations
 from pathlib import Path
 from typing import Iterable
 
@@ -35,6 +36,16 @@ REMOVE_MAX = 20
 BASE_REMOVE_COUNT = 10
 ACCEPT_TEMPERATURE = 1000.0
 PACKING_ATTEMPTS = 96
+BIG_VEHICLE_RESERVE = 5
+MERGE_ROUTE_LIMIT = 40
+MERGE_PAIR_LIMIT = 120
+RELOCATE_ROUTE_LIMIT = 60
+ROUTE_MERGE_COST_ALLOWANCE = 250.0
+RELOCATE_REMOVE_COST_ALLOWANCE = 200.0
+ROUTE_TYPE_CHANGE_COST_ALLOWANCE = 80.0
+FUEL_3000_SEARCH_RESERVE = 1
+BATCH_MERGE_LIMIT = 1
+SINGLE_MERGE_SAMPLE_LIMIT = 24
 
 
 @dataclass(frozen=True)
@@ -97,6 +108,13 @@ class RouteEvaluation:
 
 
 @dataclass
+class CandidateRouteSpec:
+    route: TypedRoute
+    route_eval: RouteEvaluation
+    roles: set[str]
+
+
+@dataclass
 class AssignedRoute:
     route_index: int
     vehicle_type: str
@@ -144,6 +162,9 @@ class SolutionEvaluation:
     mandatory_split_customer_count: int
     mandatory_split_visit_count: int
     normal_customer_count: int
+    single_stop_route_count: int
+    two_stop_route_count: int
+    three_plus_route_count: int
     late_positive_stops: int
     max_late_min: float
     latest_return_min: float
@@ -249,6 +270,128 @@ class Question1Solver:
         self.unit_by_id = {unit.unit_id: unit for unit in self.service_units}
         self.active_unit_ids = [unit.unit_id for unit in self.service_units]
         self.route_cache = RouteCache()
+        self.enable_fuel_3000_reserve = False
+
+    def _route_counts(self, routes: list[TypedRoute]) -> Counter[str]:
+        return Counter(route.vehicle_type for route in routes)
+
+    def _fuel_3000_free_count(self, route_counts: Counter[str]) -> int:
+        return self.vehicle_by_name["fuel_3000"].vehicle_count - route_counts.get("fuel_3000", 0)
+
+    def _route_has_heavy_big_only_unit(self, route: TypedRoute) -> bool:
+        return any(
+            self._is_heavy_big_only_unit(unit.weight, unit.volume, unit.eligible_vehicle_types)
+            for unit in (self.unit_by_id[unit_id] for unit_id in route.unit_ids)
+        )
+
+    def _route_has_flexible_unit(self, route: TypedRoute) -> bool:
+        return any(
+            not self._is_heavy_big_only_unit(unit.weight, unit.volume, unit.eligible_vehicle_types)
+            for unit in (self.unit_by_id[unit_id] for unit_id in route.unit_ids)
+        )
+
+    def _unit_is_heavy_big_only(self, unit_id: int) -> bool:
+        unit = self.unit_by_id[unit_id]
+        return self._is_heavy_big_only_unit(unit.weight, unit.volume, unit.eligible_vehicle_types)
+
+    def _route_big_flexible_metrics(self, route: TypedRoute) -> tuple[int, int, int]:
+        if route.vehicle_type not in {"fuel_3000", "ev_3000"}:
+            return 0, 0, 0
+        flexible_unit_count = sum(1 for unit_id in route.unit_ids if not self._unit_is_heavy_big_only(unit_id))
+        return int(flexible_unit_count > 0), flexible_unit_count, 1
+
+    def _route_metric_tuple(self, route: TypedRoute, route_eval: RouteEvaluation | None = None) -> tuple[int, int, int, int, int, float]:
+        routes_with_flexible_on_big, flexible_units_on_big, big_route_count = self._route_big_flexible_metrics(route)
+        if route_eval is None:
+            route_eval = self.evaluate_route(route)
+        return (
+            routes_with_flexible_on_big,
+            flexible_units_on_big,
+            big_route_count,
+            1,
+            int(len(route.unit_ids) == 1),
+            route_eval.best_cost,
+        )
+
+    def _aggregate_route_metric_tuple(
+        self,
+        routes: Iterable[TypedRoute],
+    ) -> tuple[int, int, int, int, int, float]:
+        metrics = [self._route_metric_tuple(route) for route in routes]
+        return (
+            sum(item[0] for item in metrics),
+            sum(item[1] for item in metrics),
+            sum(item[2] for item in metrics),
+            sum(item[3] for item in metrics),
+            sum(item[4] for item in metrics),
+            float(sum(item[5] for item in metrics)),
+        )
+
+    def _release_metric_key(self, metric_tuple: tuple[int, int, int, int, int, float]) -> tuple[int, int, int, int, int, float]:
+        return metric_tuple
+
+    def _promotion_metric_key(self, metric_tuple: tuple[int, int, int, int, int, float]) -> tuple[int, int, float, int, int, int]:
+        return (
+            metric_tuple[3],
+            metric_tuple[4],
+            round(metric_tuple[5], 6),
+            metric_tuple[0],
+            metric_tuple[1],
+            metric_tuple[2],
+        )
+
+    def _final_solution_structure_metrics(self, routes: list[TypedRoute]) -> tuple[int, int]:
+        route_metrics = [self._route_big_flexible_metrics(route) for route in routes]
+        return (
+            int(sum(item[0] for item in route_metrics)),
+            int(sum(item[1] for item in route_metrics)),
+        )
+
+    def _preserves_fuel_3000_reserve(
+        self,
+        route_counts: Counter[str],
+        current_vehicle_type: str | None,
+        candidate_vehicle_type: str,
+        unit_is_heavy_big_only: bool,
+    ) -> bool:
+        if unit_is_heavy_big_only:
+            return True
+        projected_counts = route_counts.copy()
+        if current_vehicle_type is not None:
+            projected_counts[current_vehicle_type] -= 1
+            if projected_counts[current_vehicle_type] <= 0:
+                projected_counts.pop(current_vehicle_type, None)
+        projected_counts[candidate_vehicle_type] += 1
+        return self._fuel_3000_free_count(projected_counts) >= FUEL_3000_SEARCH_RESERVE
+
+    def _choice_rank_key(
+        self,
+        route_counts: Counter[str],
+        current_vehicle_type: str | None,
+        candidate_vehicle_type: str,
+        unit_is_heavy_big_only: bool,
+        mixes_flexible_into_big: bool,
+        delta_cost: float,
+    ) -> tuple[int, int, float, tuple[float, float, int]]:
+        if not self.enable_fuel_3000_reserve:
+            return (
+                0,
+                0,
+                round(delta_cost, 6),
+                self.vehicle_size_rank[candidate_vehicle_type],
+            )
+        preserves_reserve = self._preserves_fuel_3000_reserve(
+            route_counts=route_counts,
+            current_vehicle_type=current_vehicle_type,
+            candidate_vehicle_type=candidate_vehicle_type,
+            unit_is_heavy_big_only=unit_is_heavy_big_only,
+        )
+        return (
+            0 if preserves_reserve else 1,
+            1 if mixes_flexible_into_big else 0,
+            round(delta_cost, 6),
+            self.vehicle_size_rank[candidate_vehicle_type],
+        )
 
     def _build_customer_affinity(self) -> np.ndarray:
         affinity = np.zeros((len(self.customer_ids), len(self.customer_ids)), dtype=np.float64)
@@ -510,7 +653,7 @@ class Question1Solver:
             )
 
         big_vehicle_inventory = sum(vehicle.vehicle_count for vehicle in self.vehicles if vehicle.capacity_kg >= 3000.0)
-        heavy_big_only_capacity = max(big_vehicle_inventory - normal_heavy_big_only_count, 0)
+        heavy_big_only_capacity = max(big_vehicle_inventory - BIG_VEHICLE_RESERVE - normal_heavy_big_only_count, 0)
         current_heavy_big_only = sum(
             int(customer["candidates"][customer["selected_index"]]["heavy_big_only_count"])
             for customer in mandatory_customers
@@ -586,6 +729,15 @@ class Question1Solver:
                     }
                 )
                 unit_id += 1
+        self.service_unit_summary = {
+            "mandatory_split_customer_count": len(mandatory_customers),
+            "normal_heavy_big_only_count": normal_heavy_big_only_count,
+            "mandatory_heavy_big_only_count": current_heavy_big_only,
+            "heavy_big_only_count": normal_heavy_big_only_count + current_heavy_big_only,
+            "big_vehicle_inventory": big_vehicle_inventory,
+            "big_vehicle_reserve": BIG_VEHICLE_RESERVE,
+            "heavy_big_only_capacity": heavy_big_only_capacity,
+        }
         return service_units, split_rows
 
     def _load_or_build_day_night_arc_lookups(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -1105,6 +1257,9 @@ class Question1Solver:
                     normal_customers.add(unit.orig_cust_id)
 
         split_customer_count = int(sum(1 for route_ids in customer_route_map.values() if len(route_ids) > 1))
+        single_stop_route_count = int(sum(1 for route in assigned_routes if len(route.unit_ids) == 1))
+        two_stop_route_count = int(sum(1 for route in assigned_routes if len(route.unit_ids) == 2))
+        three_plus_route_count = int(sum(1 for route in assigned_routes if len(route.unit_ids) >= 3))
         return SolutionEvaluation(
             total_cost=total_cost,
             total_energy_cost=total_energy_cost,
@@ -1123,6 +1278,9 @@ class Question1Solver:
             mandatory_split_customer_count=len(mandatory_split_customers),
             mandatory_split_visit_count=mandatory_split_visit_count,
             normal_customer_count=len(normal_customers),
+            single_stop_route_count=single_stop_route_count,
+            two_stop_route_count=two_stop_route_count,
+            three_plus_route_count=three_plus_route_count,
             late_positive_stops=late_positive_stops,
             max_late_min=max_late_min,
             latest_return_min=latest_return_min,
@@ -1133,12 +1291,17 @@ class Question1Solver:
             assigned_routes=assigned_routes,
         )
 
-    def _solution_rank_key(self, solution_eval: SolutionEvaluation) -> tuple[float, int, float, int, float]:
+    def _solution_rank_key(self, solution_eval: SolutionEvaluation) -> tuple[int, int, int, int, float, float, float]:
+        structural_split_gap = abs(
+            solution_eval.split_customer_count - solution_eval.mandatory_split_customer_count
+        )
         return (
-            round(solution_eval.total_cost, 6),
+            structural_split_gap,
+            solution_eval.single_stop_route_count,
             solution_eval.used_vehicle_count,
-            round(solution_eval.total_late_min, 6),
             solution_eval.split_customer_count,
+            round(solution_eval.total_cost, 6),
+            round(solution_eval.total_late_min, 6),
             round(solution_eval.total_carbon_kg, 6),
         )
 
@@ -1167,34 +1330,34 @@ class Question1Solver:
 
     def _choose_best_new_route(self, unit_id: int, route_counts: Counter[str]) -> tuple[TypedRoute, RouteEvaluation] | None:
         unit = self.unit_by_id[unit_id]
-        options: list[tuple[TypedRoute, RouteEvaluation]] = []
+        unit_is_heavy_big_only = self._is_heavy_big_only_unit(unit.weight, unit.volume, unit.eligible_vehicle_types)
+        options: list[tuple[tuple[int, int, float, tuple[float, float, int]], TypedRoute, RouteEvaluation]] = []
         for vehicle_type in unit.eligible_vehicle_types:
             if route_counts[vehicle_type] >= self.vehicle_by_name[vehicle_type].vehicle_count:
                 continue
             candidate_route = TypedRoute(vehicle_type=vehicle_type, unit_ids=(unit_id,))
             candidate_eval = self.evaluate_route(candidate_route)
             if candidate_eval.feasible:
-                options.append((candidate_route, candidate_eval))
+                rank_key = self._choice_rank_key(
+                    route_counts=route_counts,
+                    current_vehicle_type=None,
+                    candidate_vehicle_type=vehicle_type,
+                    unit_is_heavy_big_only=unit_is_heavy_big_only,
+                    mixes_flexible_into_big=(vehicle_type == "fuel_3000" and not unit_is_heavy_big_only),
+                    delta_cost=candidate_eval.best_cost,
+                )
+                options.append((rank_key, candidate_route, candidate_eval))
         if not options:
             return None
-        min_cost = min(candidate_eval.best_cost for _, candidate_eval in options)
-        near_best = [
-            (route, candidate_eval)
-            for route, candidate_eval in options
-            if candidate_eval.best_cost <= min_cost * 1.02 + 1e-9
-        ]
-        near_best.sort(
-            key=lambda item: (
-                self.vehicle_size_rank[item[0].vehicle_type],
-                item[1].best_cost,
-            )
-        )
-        return near_best[0]
+        options.sort(key=lambda item: item[0])
+        _, best_route, best_eval = options[0]
+        return best_route, best_eval
 
     def _insert_unit_best(self, routes: list[TypedRoute], unit_id: int) -> list[TypedRoute] | None:
         unit = self.unit_by_id[unit_id]
-        route_counts = Counter(route.vehicle_type for route in routes)
-        best_delta = np.inf
+        route_counts = self._route_counts(routes)
+        unit_is_heavy_big_only = self._is_heavy_big_only_unit(unit.weight, unit.volume, unit.eligible_vehicle_types)
+        best_rank: tuple[int, int, float, tuple[float, float, int]] | None = None
         best_routes: list[TypedRoute] | None = None
         candidate_groups = [self._candidate_route_indices_for_unit(routes, unit_id) if routes else []]
         if routes:
@@ -1217,17 +1380,38 @@ class Question1Solver:
                     if not candidate_eval.feasible:
                         continue
                     delta = candidate_eval.best_cost - base_eval.best_cost
-                    if delta + 1e-6 < best_delta:
+                    mixes_flexible_into_big = (
+                        route.vehicle_type == "fuel_3000"
+                        and not unit_is_heavy_big_only
+                        and self._route_has_flexible_unit(candidate_route)
+                    )
+                    rank_key = self._choice_rank_key(
+                        route_counts=route_counts,
+                        current_vehicle_type=route.vehicle_type,
+                        candidate_vehicle_type=route.vehicle_type,
+                        unit_is_heavy_big_only=unit_is_heavy_big_only,
+                        mixes_flexible_into_big=mixes_flexible_into_big,
+                        delta_cost=delta,
+                    )
+                    if best_rank is None or rank_key < best_rank:
                         updated = list(routes)
                         updated[route_idx] = candidate_route
-                        best_delta = delta
+                        best_rank = rank_key
                         best_routes = updated
             if best_routes is not None:
                 break
         new_route_choice = self._choose_best_new_route(unit_id, route_counts)
         if new_route_choice is not None:
             new_route, new_eval = new_route_choice
-            if new_eval.best_cost + 1e-6 < best_delta:
+            new_route_rank = self._choice_rank_key(
+                route_counts=route_counts,
+                current_vehicle_type=None,
+                candidate_vehicle_type=new_route.vehicle_type,
+                unit_is_heavy_big_only=unit_is_heavy_big_only,
+                mixes_flexible_into_big=(new_route.vehicle_type == "fuel_3000" and not unit_is_heavy_big_only),
+                delta_cost=new_eval.best_cost,
+            )
+            if best_rank is None or new_route_rank < best_rank:
                 best_routes = list(routes) + [new_route]
         return best_routes
 
@@ -1357,6 +1541,659 @@ class Question1Solver:
             routes = updated_routes
         return [route for route in routes if route.unit_ids]
 
+    def _try_reserve_repair_rebuild(self, routes: list[TypedRoute]) -> tuple[bool, list[TypedRoute]]:
+        route_counts = self._route_counts(routes)
+        if self._fuel_3000_free_count(route_counts) >= FUEL_3000_SEARCH_RESERVE:
+            return False, routes
+        partial_routes: list[TypedRoute] = []
+        removed_units: list[int] = []
+        for route in routes:
+            if route.vehicle_type == "fuel_3000" and self._route_has_flexible_unit(route):
+                removed_units.extend(
+                    unit_id
+                    for unit_id in route.unit_ids
+                    if not self._is_heavy_big_only_unit(
+                        self.unit_by_id[unit_id].weight,
+                        self.unit_by_id[unit_id].volume,
+                        self.unit_by_id[unit_id].eligible_vehicle_types,
+                    )
+                )
+                kept_unit_ids = tuple(
+                    unit_id
+                    for unit_id in route.unit_ids
+                    if self._is_heavy_big_only_unit(
+                        self.unit_by_id[unit_id].weight,
+                        self.unit_by_id[unit_id].volume,
+                        self.unit_by_id[unit_id].eligible_vehicle_types,
+                    )
+                )
+                if kept_unit_ids:
+                    partial_routes.append(TypedRoute(route.vehicle_type, kept_unit_ids))
+            else:
+                partial_routes.append(route)
+        if not removed_units:
+            return False, routes
+        self.enable_fuel_3000_reserve = True
+        try:
+            rebuilt = self.repair_solution(partial_routes, removed_units)
+        finally:
+            self.enable_fuel_3000_reserve = False
+        if rebuilt is None:
+            return False, routes
+        rebuilt_counts = self._route_counts(rebuilt)
+        if self._fuel_3000_free_count(rebuilt_counts) >= FUEL_3000_SEARCH_RESERVE:
+            return True, rebuilt
+        return False, routes
+
+    def _single_stop_merge_candidates(
+        self,
+        routes: list[TypedRoute],
+    ) -> tuple[list[dict[str, object]], int, int]:
+        route_counts = self._route_counts(routes)
+        single_routes = [
+            (idx, route)
+            for idx, route in enumerate(routes)
+            if len(route.unit_ids) == 1 and route.vehicle_type in {"fuel_1500", "fuel_1250", "ev_1250"}
+        ]
+        candidates: list[dict[str, object]] = []
+        feasible_pair_count = 0
+        inventory_blocked_pair_count = 0
+        for left_pos, (left_idx, left_route) in enumerate(single_routes):
+            left_unit = self.unit_by_id[left_route.unit_ids[0]]
+            left_eval = self.evaluate_route(left_route)
+            for right_idx, right_route in single_routes[left_pos + 1 :]:
+                right_unit = self.unit_by_id[right_route.unit_ids[0]]
+                if left_unit.orig_cust_id == right_unit.orig_cust_id:
+                    continue
+                shared_vehicle_types = set(left_unit.eligible_vehicle_types) & set(right_unit.eligible_vehicle_types)
+                if "fuel_3000" not in shared_vehicle_types:
+                    continue
+                best_candidate: dict[str, object] | None = None
+                for unit_ids in ((left_route.unit_ids[0], right_route.unit_ids[0]), (right_route.unit_ids[0], left_route.unit_ids[0])):
+                    candidate_route = TypedRoute(vehicle_type="fuel_3000", unit_ids=unit_ids)
+                    candidate_eval = self.evaluate_route(candidate_route)
+                    if not candidate_eval.feasible:
+                        continue
+                    feasible_pair_count += 1
+                    projected_count = route_counts["fuel_3000"] + 1
+                    inventory_ok = projected_count <= self.vehicle_by_name["fuel_3000"].vehicle_count
+                    if not inventory_ok:
+                        inventory_blocked_pair_count += 1
+                    separate_cost = left_eval.best_cost + self.evaluate_route(right_route).best_cost
+                    saving = separate_cost - candidate_eval.best_cost
+                    candidate = {
+                        "left_route_idx": left_idx,
+                        "right_route_idx": right_idx,
+                        "left_route_id": left_idx + 1,
+                        "right_route_id": right_idx + 1,
+                        "left_unit_id": left_route.unit_ids[0],
+                        "right_unit_id": right_route.unit_ids[0],
+                        "left_customer": left_unit.orig_cust_id,
+                        "right_customer": right_unit.orig_cust_id,
+                        "vehicle_type": "fuel_3000",
+                        "merged_unit_ids": unit_ids,
+                        "separate_cost": separate_cost,
+                        "merged_cost": candidate_eval.best_cost,
+                        "saving": saving,
+                        "distance_km": self._distance_between(left_unit.orig_cust_id, right_unit.orig_cust_id),
+                        "tw_gap_min": max(
+                            0.0,
+                            max(left_unit.tw_start_min, right_unit.tw_start_min)
+                            - min(left_unit.tw_end_min, right_unit.tw_end_min),
+                        ),
+                        "inventory_ok": inventory_ok,
+                    }
+                    if best_candidate is None or (
+                        candidate["merged_cost"],
+                        candidate["distance_km"],
+                        candidate["tw_gap_min"],
+                    ) < (
+                        best_candidate["merged_cost"],
+                        best_candidate["distance_km"],
+                        best_candidate["tw_gap_min"],
+                    ):
+                        best_candidate = candidate
+                if best_candidate is not None:
+                    candidates.append(best_candidate)
+        candidates.sort(
+            key=lambda item: (
+                0 if bool(item["inventory_ok"]) else 1,
+                -float(item["saving"]),
+                float(item["distance_km"]),
+                float(item["tw_gap_min"]),
+            )
+        )
+        return candidates, feasible_pair_count, inventory_blocked_pair_count
+
+    def _apply_batch_small_to_fuel3000_merge(
+        self,
+        routes: list[TypedRoute],
+    ) -> tuple[list[TypedRoute], dict[str, int], list[dict[str, object]]]:
+        updated_routes = list(routes)
+        success_count = 0
+        diagnostics: list[dict[str, object]] = []
+        for candidate in self._single_stop_merge_candidates(updated_routes)[0]:
+            if success_count >= BATCH_MERGE_LIMIT:
+                break
+            if not bool(candidate["inventory_ok"]) or float(candidate["saving"]) <= 1e-6:
+                diagnostics.append(candidate)
+                continue
+            left_idx = int(candidate["left_route_idx"])
+            right_idx = int(candidate["right_route_idx"])
+            if left_idx >= len(updated_routes) or right_idx >= len(updated_routes):
+                continue
+            if updated_routes[left_idx].unit_ids != (int(candidate["left_unit_id"]),):
+                continue
+            if updated_routes[right_idx].unit_ids != (int(candidate["right_unit_id"]),):
+                continue
+            merged_route = TypedRoute("fuel_3000", tuple(int(unit_id) for unit_id in candidate["merged_unit_ids"]))
+            merged_eval = self.evaluate_route(merged_route)
+            if not merged_eval.feasible:
+                continue
+            kept = [
+                route
+                for idx, route in enumerate(updated_routes)
+                if idx not in {left_idx, right_idx}
+            ]
+            kept.append(merged_route)
+            if self.evaluate_solution(kept) is None:
+                continue
+            updated_routes = kept
+            success_count += 1
+            diagnostics.append({**candidate, "accepted": 1})
+        return updated_routes, {"batch_merge_success_count": success_count}, diagnostics
+
+    def _register_candidate_route(
+        self,
+        route_pool: dict[tuple[str, tuple[int, ...]], CandidateRouteSpec],
+        vehicle_type: str,
+        unit_ids: tuple[int, ...],
+        role: str,
+    ) -> None:
+        key = (vehicle_type, tuple(unit_ids))
+        if key in route_pool:
+            route_pool[key].roles.add(role)
+            return
+        candidate_route = TypedRoute(vehicle_type=vehicle_type, unit_ids=tuple(unit_ids))
+        candidate_eval = self.evaluate_route(candidate_route)
+        if not candidate_eval.feasible:
+            return
+        route_pool[key] = CandidateRouteSpec(
+            route=candidate_route,
+            route_eval=candidate_eval,
+            roles={role},
+        )
+
+    def _generate_route_pool(
+        self,
+        seed_routes: list[TypedRoute],
+    ) -> dict[tuple[str, tuple[int, ...]], CandidateRouteSpec]:
+        route_pool: dict[tuple[str, tuple[int, ...]], CandidateRouteSpec] = {}
+        small_vehicle_types = ("fuel_1250", "ev_1250", "fuel_1500")
+        big_vehicle_types = ("fuel_3000", "ev_3000")
+        units_by_customer: dict[int, list[int]] = defaultdict(list)
+        for unit in self.service_units:
+            units_by_customer[unit.orig_cust_id].append(unit.unit_id)
+
+        for route in seed_routes:
+            self._register_candidate_route(route_pool, route.vehicle_type, route.unit_ids, "seed")
+
+        for unit in self.service_units:
+            for vehicle_type in unit.eligible_vehicle_types:
+                self._register_candidate_route(route_pool, vehicle_type, (unit.unit_id,), "singleton")
+
+        flexible_unit_ids = [unit_id for unit_id in self.active_unit_ids if not self._unit_is_heavy_big_only(unit_id)]
+        heavy_unit_ids = [unit_id for unit_id in self.active_unit_ids if self._unit_is_heavy_big_only(unit_id)]
+
+        flexible_neighbors: dict[int, list[int]] = {}
+        for unit_id in flexible_unit_ids:
+            unit = self.unit_by_id[unit_id]
+            neighbor_units: list[int] = []
+            for cust_id in self.customer_neighbors.get(unit.orig_cust_id, [])[:6]:
+                for neighbor_unit_id in units_by_customer.get(cust_id, []):
+                    if neighbor_unit_id != unit_id and not self._unit_is_heavy_big_only(neighbor_unit_id):
+                        neighbor_units.append(neighbor_unit_id)
+            # Keep deterministic order and avoid duplicates.
+            flexible_neighbors[unit_id] = list(dict.fromkeys(neighbor_units))[:6]
+
+        heavy_neighbors: dict[int, list[int]] = {}
+        for unit_id in heavy_unit_ids:
+            unit = self.unit_by_id[unit_id]
+            neighbor_units: list[int] = []
+            for cust_id in self.customer_neighbors.get(unit.orig_cust_id, [])[:4]:
+                for neighbor_unit_id in units_by_customer.get(cust_id, []):
+                    if neighbor_unit_id != unit_id and self._unit_is_heavy_big_only(neighbor_unit_id):
+                        neighbor_units.append(neighbor_unit_id)
+            heavy_neighbors[unit_id] = list(dict.fromkeys(neighbor_units))[:4]
+
+        for unit_id in flexible_unit_ids:
+            unit = self.unit_by_id[unit_id]
+            for neighbor_unit_id in flexible_neighbors[unit_id]:
+                if unit_id >= neighbor_unit_id:
+                    continue
+                neighbor_unit = self.unit_by_id[neighbor_unit_id]
+                if unit.orig_cust_id == neighbor_unit.orig_cust_id:
+                    continue
+                common_small_types = [
+                    vehicle_type
+                    for vehicle_type in small_vehicle_types
+                    if vehicle_type in unit.eligible_vehicle_types and vehicle_type in neighbor_unit.eligible_vehicle_types
+                ]
+                for vehicle_type in common_small_types[:2]:
+                    for ordered_unit_ids in ((unit_id, neighbor_unit_id), (neighbor_unit_id, unit_id)):
+                        self._register_candidate_route(route_pool, vehicle_type, ordered_unit_ids, "flex_small")
+                common_big_types = [
+                    vehicle_type
+                    for vehicle_type in big_vehicle_types
+                    if vehicle_type in unit.eligible_vehicle_types and vehicle_type in neighbor_unit.eligible_vehicle_types
+                ]
+                for vehicle_type in common_big_types:
+                    for ordered_unit_ids in ((unit_id, neighbor_unit_id), (neighbor_unit_id, unit_id)):
+                        self._register_candidate_route(route_pool, vehicle_type, ordered_unit_ids, "promotion")
+
+        for unit_id in flexible_unit_ids:
+            unit = self.unit_by_id[unit_id]
+            triple_candidates = [neighbor_unit_id for neighbor_unit_id in flexible_neighbors[unit_id] if neighbor_unit_id > unit_id]
+            for left_neighbor_id, right_neighbor_id in combinations(triple_candidates[:4], 2):
+                left_neighbor = self.unit_by_id[left_neighbor_id]
+                right_neighbor = self.unit_by_id[right_neighbor_id]
+                if len({unit.orig_cust_id, left_neighbor.orig_cust_id, right_neighbor.orig_cust_id}) < 3:
+                    continue
+                common_small_types = [
+                    vehicle_type
+                    for vehicle_type in small_vehicle_types
+                    if vehicle_type in unit.eligible_vehicle_types
+                    and vehicle_type in left_neighbor.eligible_vehicle_types
+                    and vehicle_type in right_neighbor.eligible_vehicle_types
+                ]
+                common_big_types = [
+                    vehicle_type
+                    for vehicle_type in big_vehicle_types
+                    if vehicle_type in unit.eligible_vehicle_types
+                    and vehicle_type in left_neighbor.eligible_vehicle_types
+                    and vehicle_type in right_neighbor.eligible_vehicle_types
+                ]
+                for ordered_unit_ids in permutations((unit_id, left_neighbor_id, right_neighbor_id)):
+                    if common_small_types:
+                        self._register_candidate_route(route_pool, common_small_types[0], tuple(ordered_unit_ids), "flex_small")
+                    for vehicle_type in common_big_types:
+                        self._register_candidate_route(route_pool, vehicle_type, tuple(ordered_unit_ids), "promotion")
+
+        for unit_id in heavy_unit_ids:
+            unit = self.unit_by_id[unit_id]
+            for vehicle_type in [name for name in big_vehicle_types if name in unit.eligible_vehicle_types]:
+                self._register_candidate_route(route_pool, vehicle_type, (unit_id,), "rigid_big")
+            for neighbor_unit_id in heavy_neighbors[unit_id]:
+                if unit_id >= neighbor_unit_id:
+                    continue
+                neighbor_unit = self.unit_by_id[neighbor_unit_id]
+                common_big_types = [
+                    vehicle_type
+                    for vehicle_type in big_vehicle_types
+                    if vehicle_type in unit.eligible_vehicle_types and vehicle_type in neighbor_unit.eligible_vehicle_types
+                ]
+                for vehicle_type in common_big_types:
+                    for ordered_unit_ids in ((unit_id, neighbor_unit_id), (neighbor_unit_id, unit_id)):
+                        self._register_candidate_route(route_pool, vehicle_type, ordered_unit_ids, "rigid_big")
+        return route_pool
+
+    def _route_pool_role_counts(
+        self,
+        route_pool: dict[tuple[str, tuple[int, ...]], CandidateRouteSpec],
+    ) -> dict[str, int]:
+        role_counts = Counter[str]()
+        for spec in route_pool.values():
+            for role in spec.roles:
+                role_counts[role] += 1
+        return dict(role_counts)
+
+    def _search_cluster_cover(
+        self,
+        cluster_routes: list[TypedRoute],
+        current_routes: list[TypedRoute],
+        route_pool: dict[tuple[str, tuple[int, ...]], CandidateRouteSpec],
+        phase: str,
+        allowed_roles: set[str],
+        max_cover_routes: int,
+    ) -> list[TypedRoute] | None:
+        cluster_unit_set = frozenset(unit_id for route in cluster_routes for unit_id in route.unit_ids)
+        current_metric_tuple = self._aggregate_route_metric_tuple(cluster_routes)
+        base_route_counts = self._route_counts(current_routes)
+        for route in cluster_routes:
+            base_route_counts[route.vehicle_type] -= 1
+            if base_route_counts[route.vehicle_type] <= 0:
+                base_route_counts.pop(route.vehicle_type, None)
+
+        relevant_specs = [
+            spec
+            for spec in route_pool.values()
+            if spec.roles & allowed_roles and set(spec.route.unit_ids).issubset(cluster_unit_set)
+        ]
+        if not relevant_specs:
+            return None
+
+        # Always allow the current route shapes inside the cluster search.
+        local_pool = dict(route_pool)
+        for route in cluster_routes:
+            self._register_candidate_route(local_pool, route.vehicle_type, route.unit_ids, "current")
+        relevant_specs = [
+            spec
+            for spec in local_pool.values()
+            if spec.roles & (allowed_roles | {"current"}) and set(spec.route.unit_ids).issubset(cluster_unit_set)
+        ]
+        relevant_specs.sort(
+            key=lambda spec: (
+                -len(spec.route.unit_ids),
+                0 if "promotion" in spec.roles else 1 if "rigid_big" in spec.roles else 2,
+                spec.route_eval.best_cost,
+                spec.route.vehicle_type,
+                spec.route.unit_ids,
+            )
+        )
+        relevant_specs = relevant_specs[:40]
+        specs_by_unit: dict[int, list[int]] = defaultdict(list)
+        for idx, spec in enumerate(relevant_specs):
+            for unit_id in spec.route.unit_ids:
+                specs_by_unit[unit_id].append(idx)
+
+        best_cover_routes: list[TypedRoute] | None = None
+        best_metric_key: tuple[object, ...] | None = None
+
+        def metric_key(metric_tuple: tuple[int, int, int, int, int, float]) -> tuple[object, ...]:
+            if phase == "release":
+                return self._release_metric_key(metric_tuple)
+            return self._promotion_metric_key(metric_tuple)
+
+        current_metric_key = metric_key(current_metric_tuple)
+
+        def dfs(
+            uncovered_units: frozenset[int],
+            selected_specs: list[CandidateRouteSpec],
+            selected_metric_tuple: tuple[int, int, int, int, int, float],
+            projected_counts: Counter[str],
+        ) -> None:
+            nonlocal best_cover_routes, best_metric_key
+            if len(selected_specs) > max_cover_routes:
+                return
+            if not uncovered_units:
+                candidate_key = metric_key(selected_metric_tuple)
+                if candidate_key < current_metric_key and (best_metric_key is None or candidate_key < best_metric_key):
+                    best_metric_key = candidate_key
+                    best_cover_routes = [spec.route for spec in selected_specs]
+                return
+            pivot_unit_id = min(uncovered_units, key=lambda unit_id: len(specs_by_unit.get(unit_id, [])))
+            for spec_idx in specs_by_unit.get(pivot_unit_id, []):
+                spec = relevant_specs[spec_idx]
+                spec_unit_set = set(spec.route.unit_ids)
+                if not spec_unit_set.issubset(uncovered_units):
+                    continue
+                projected_count = projected_counts[spec.route.vehicle_type] + 1
+                if projected_count > self.vehicle_by_name[spec.route.vehicle_type].vehicle_count:
+                    continue
+                new_counts = projected_counts.copy()
+                new_counts[spec.route.vehicle_type] = projected_count
+                route_metric = self._route_metric_tuple(spec.route, spec.route_eval)
+                new_metric_tuple = (
+                    selected_metric_tuple[0] + route_metric[0],
+                    selected_metric_tuple[1] + route_metric[1],
+                    selected_metric_tuple[2] + route_metric[2],
+                    selected_metric_tuple[3] + route_metric[3],
+                    selected_metric_tuple[4] + route_metric[4],
+                    selected_metric_tuple[5] + route_metric[5],
+                )
+                dfs(
+                    frozenset(uncovered_units - spec_unit_set),
+                    selected_specs + [spec],
+                    new_metric_tuple,
+                    new_counts,
+                )
+
+        dfs(
+            uncovered_units=cluster_unit_set,
+            selected_specs=[],
+            selected_metric_tuple=(0, 0, 0, 0, 0, 0.0),
+            projected_counts=base_route_counts,
+        )
+        return best_cover_routes
+
+    def _apply_cluster_rebuild(
+        self,
+        current_routes: list[TypedRoute],
+        cluster_indices: tuple[int, ...],
+        replacement_routes: list[TypedRoute],
+    ) -> list[TypedRoute]:
+        rebuilt_routes = [
+            route
+            for idx, route in enumerate(current_routes)
+            if idx not in set(cluster_indices)
+        ]
+        rebuilt_routes.extend(replacement_routes)
+        return rebuilt_routes
+
+    def _try_release_with_route_pool(
+        self,
+        current_routes: list[TypedRoute],
+        route_pool: dict[tuple[str, tuple[int, ...]], CandidateRouteSpec],
+    ) -> tuple[bool, list[TypedRoute], dict[str, object] | None]:
+        prioritized_indices = sorted(
+            range(len(current_routes)),
+            key=lambda idx: (
+                -self._route_big_flexible_metrics(current_routes[idx])[1],
+                -len(current_routes[idx].unit_ids),
+                idx,
+            ),
+        )
+        for route_idx in prioritized_indices:
+            route = current_routes[route_idx]
+            flexible_metric = self._route_big_flexible_metrics(route)
+            if flexible_metric[1] == 0:
+                continue
+            replacement_routes = self._search_cluster_cover(
+                cluster_routes=[route],
+                current_routes=current_routes,
+                route_pool=route_pool,
+                phase="release",
+                allowed_roles={"seed", "singleton", "flex_small", "rigid_big", "current"},
+                max_cover_routes=2,
+            )
+            if replacement_routes is None:
+                continue
+            candidate_routes = self._apply_cluster_rebuild(current_routes, (route_idx,), replacement_routes)
+            if self.evaluate_solution(candidate_routes) is None:
+                continue
+            return True, candidate_routes, {
+                "source_state": "diagnostic",
+                "candidate_type": "release",
+                "cluster_route_ids": str((route_idx + 1,)),
+                "cluster_unit_ids": ",".join(str(unit_id) for unit_id in route.unit_ids),
+                "old_route_count": 1,
+                "new_route_count": len(replacement_routes),
+                "old_flexible_big_routes": flexible_metric[0],
+                "new_flexible_big_routes": sum(self._route_big_flexible_metrics(item)[0] for item in replacement_routes),
+                "old_flexible_big_units": flexible_metric[1],
+                "new_flexible_big_units": sum(self._route_big_flexible_metrics(item)[1] for item in replacement_routes),
+                "accepted": 1,
+            }
+        return False, current_routes, None
+
+    def _promotion_cluster_candidates(
+        self,
+        current_routes: list[TypedRoute],
+        route_pool: dict[tuple[str, tuple[int, ...]], CandidateRouteSpec],
+    ) -> list[tuple[int, ...]]:
+        unit_to_route_idx: dict[int, int] = {}
+        for route_idx, route in enumerate(current_routes):
+            for unit_id in route.unit_ids:
+                unit_to_route_idx[unit_id] = route_idx
+        clusters: list[tuple[int, ...]] = []
+        seen_clusters: set[tuple[int, ...]] = set()
+        for spec in route_pool.values():
+            if "promotion" not in spec.roles:
+                continue
+            if len(spec.route.unit_ids) not in {2, 3}:
+                continue
+            cluster_indices = tuple(sorted({unit_to_route_idx[unit_id] for unit_id in spec.route.unit_ids}))
+            if len(cluster_indices) <= 1 or len(cluster_indices) > 3:
+                continue
+            cluster_routes = [current_routes[idx] for idx in cluster_indices]
+            if any(route.vehicle_type in {"fuel_3000", "ev_3000"} for route in cluster_routes):
+                continue
+            if any(len(route.unit_ids) > 2 for route in cluster_routes):
+                continue
+            if cluster_indices in seen_clusters:
+                continue
+            seen_clusters.add(cluster_indices)
+            clusters.append(cluster_indices)
+        clusters.sort(
+            key=lambda cluster_indices: (
+                -len(cluster_indices),
+                -sum(int(len(current_routes[idx].unit_ids) == 1) for idx in cluster_indices),
+                cluster_indices,
+            )
+        )
+        return clusters
+
+    def _try_promotion_with_route_pool(
+        self,
+        current_routes: list[TypedRoute],
+        route_pool: dict[tuple[str, tuple[int, ...]], CandidateRouteSpec],
+    ) -> tuple[bool, list[TypedRoute], dict[str, object] | None]:
+        for cluster_indices in self._promotion_cluster_candidates(current_routes, route_pool):
+            cluster_routes = [current_routes[idx] for idx in cluster_indices]
+            old_single_stop_count = sum(int(len(route.unit_ids) == 1) for route in cluster_routes)
+            replacement_routes = self._search_cluster_cover(
+                cluster_routes=cluster_routes,
+                current_routes=current_routes,
+                route_pool=route_pool,
+                phase="promotion",
+                allowed_roles={"seed", "singleton", "flex_small", "promotion", "current"},
+                max_cover_routes=len(cluster_routes),
+            )
+            if replacement_routes is None:
+                continue
+            new_single_stop_count = sum(int(len(route.unit_ids) == 1) for route in replacement_routes)
+            if len(replacement_routes) >= len(cluster_routes) and new_single_stop_count >= old_single_stop_count:
+                continue
+            candidate_routes = self._apply_cluster_rebuild(current_routes, cluster_indices, replacement_routes)
+            if self.evaluate_solution(candidate_routes) is None:
+                continue
+            return True, candidate_routes, {
+                "source_state": "diagnostic",
+                "candidate_type": "promotion",
+                "cluster_route_ids": str(tuple(idx + 1 for idx in cluster_indices)),
+                "cluster_unit_ids": ",".join(str(unit_id) for route in cluster_routes for unit_id in route.unit_ids),
+                "old_route_count": len(cluster_routes),
+                "new_route_count": len(replacement_routes),
+                "old_single_stop_count": old_single_stop_count,
+                "new_single_stop_count": new_single_stop_count,
+                "accepted": 1,
+            }
+        return False, current_routes, None
+
+    def _route_pool_solution_key(
+        self,
+        routes: list[TypedRoute],
+        solution_eval: SolutionEvaluation,
+    ) -> tuple[int, int, int, int, float]:
+        routes_with_flexible_on_big, flexible_units_on_big = self._final_solution_structure_metrics(routes)
+        return (
+            routes_with_flexible_on_big,
+            flexible_units_on_big,
+            solution_eval.single_stop_route_count,
+            solution_eval.route_count,
+            round(solution_eval.total_cost, 6),
+        )
+
+    def _route_pool_optimize_solution(
+        self,
+        solution: list[TypedRoute],
+    ) -> tuple[list[TypedRoute], dict[str, object]]:
+        current_routes = [self._two_opt_route(route) for route in solution]
+        route_pool = self._generate_route_pool(current_routes)
+        diagnostics: list[dict[str, object]] = []
+        stats = {
+            "route_pool_release_success_count": 0,
+            "route_pool_promotion_success_count": 0,
+        }
+
+        release_improved = True
+        release_loops = 0
+        while release_improved and release_loops < 12:
+            release_improved = False
+            changed, current_routes, diag_row = self._try_release_with_route_pool(current_routes, route_pool)
+            if changed:
+                release_improved = True
+                release_loops += 1
+                stats["route_pool_release_success_count"] += 1
+                if diag_row is not None:
+                    diagnostics.append(diag_row)
+                for route in current_routes:
+                    self._register_candidate_route(route_pool, route.vehicle_type, route.unit_ids, "current")
+                if self._fuel_3000_free_count(self._route_counts(current_routes)) >= FUEL_3000_SEARCH_RESERVE:
+                    break
+
+        promotion_improved = True
+        promotion_loops = 0
+        while promotion_improved and promotion_loops < 12:
+            promotion_improved = False
+            changed, current_routes, diag_row = self._try_promotion_with_route_pool(current_routes, route_pool)
+            if changed:
+                promotion_improved = True
+                promotion_loops += 1
+                stats["route_pool_promotion_success_count"] += 1
+                if diag_row is not None:
+                    diagnostics.append(diag_row)
+                for route in current_routes:
+                    self._register_candidate_route(route_pool, route.vehicle_type, route.unit_ids, "current")
+
+        return current_routes, {
+            **stats,
+            "route_pool_candidate_count": len(route_pool),
+            "route_pool_role_counts": self._route_pool_role_counts(route_pool),
+            "route_pool_diagnostics_rows": diagnostics[:SINGLE_MERGE_SAMPLE_LIMIT],
+        }
+
+    def _current_single_pair_inventory_counts(self, routes: list[TypedRoute]) -> tuple[int, int]:
+        route_counts = self._route_counts(routes)
+        single_routes = [
+            route
+            for route in routes
+            if len(route.unit_ids) == 1 and route.vehicle_type in {"fuel_1500", "fuel_1250", "ev_1250"}
+        ]
+        all_feasible = 0
+        inventory_feasible = 0
+        for left_route, right_route in combinations(single_routes, 2):
+            left_unit = self.unit_by_id[left_route.unit_ids[0]]
+            right_unit = self.unit_by_id[right_route.unit_ids[0]]
+            if left_unit.orig_cust_id == right_unit.orig_cust_id:
+                continue
+            shared_vehicle_types = set(left_unit.eligible_vehicle_types) & set(right_unit.eligible_vehicle_types)
+            if not ({"fuel_3000", "ev_3000"} & shared_vehicle_types):
+                continue
+            pair_is_feasible = False
+            pair_is_inventory_feasible = False
+            for vehicle_type in ("fuel_3000", "ev_3000"):
+                if vehicle_type not in shared_vehicle_types:
+                    continue
+                projected_count = (
+                    route_counts.get(vehicle_type, 0)
+                    + 1
+                    - int(left_route.vehicle_type == vehicle_type)
+                    - int(right_route.vehicle_type == vehicle_type)
+                )
+                inventory_ok = projected_count <= self.vehicle_by_name[vehicle_type].vehicle_count
+                for ordered_unit_ids in ((left_route.unit_ids[0], right_route.unit_ids[0]), (right_route.unit_ids[0], left_route.unit_ids[0])):
+                    candidate_eval = self.evaluate_route(TypedRoute(vehicle_type=vehicle_type, unit_ids=ordered_unit_ids))
+                    if not candidate_eval.feasible:
+                        continue
+                    pair_is_feasible = True
+                    if inventory_ok:
+                        pair_is_inventory_feasible = True
+                    break
+            all_feasible += int(pair_is_feasible)
+            inventory_feasible += int(pair_is_inventory_feasible)
+        return all_feasible, inventory_feasible
+
     def _two_opt_route(self, route: TypedRoute) -> TypedRoute:
         if len(route.unit_ids) < 4:
             return route
@@ -1383,7 +2220,74 @@ class Question1Solver:
                     break
         return best_route
 
+    def _try_route_merge(self, routes: list[TypedRoute]) -> tuple[bool, list[TypedRoute]]:
+        base_eval = self.evaluate_solution(routes)
+        if base_eval is None:
+            return False, routes
+        route_counts = Counter(route.vehicle_type for route in routes)
+        route_evals = [self.evaluate_route(route) for route in routes]
+        prioritized_indices = sorted(
+            range(len(routes)),
+            key=lambda idx: (
+                0 if len(routes[idx].unit_ids) == 1 else 1 if len(routes[idx].unit_ids) == 2 else 2,
+                len(routes[idx].unit_ids),
+                idx,
+            ),
+        )[:MERGE_ROUTE_LIMIT]
+        pair_count = 0
+        for left_order, left_idx in enumerate(prioritized_indices):
+            left_route = routes[left_idx]
+            if len(left_route.unit_ids) > 2:
+                continue
+            left_customers = self._route_customers(left_route)
+            for right_idx in prioritized_indices[left_order + 1 :]:
+                pair_count += 1
+                if pair_count > MERGE_PAIR_LIMIT:
+                    return False, routes
+                right_route = routes[right_idx]
+                if len(right_route.unit_ids) > 2:
+                    continue
+                right_customers = self._route_customers(right_route)
+                if left_customers & right_customers:
+                    continue
+                common_vehicle_types = [left_route.vehicle_type] if left_route.vehicle_type == right_route.vehicle_type else []
+                current_units = [self.unit_by_id[unit_id] for unit_id in (*left_route.unit_ids, *right_route.unit_ids)]
+                shared_types = set(current_units[0].eligible_vehicle_types)
+                for unit in current_units[1:]:
+                    shared_types &= set(unit.eligible_vehicle_types)
+                for vehicle_type in sorted(shared_types, key=lambda name: self.vehicle_size_rank[name]):
+                    if vehicle_type not in common_vehicle_types:
+                        common_vehicle_types.append(vehicle_type)
+                sequences = {
+                    left_route.unit_ids + right_route.unit_ids,
+                    right_route.unit_ids + left_route.unit_ids,
+                    tuple(reversed(left_route.unit_ids)) + right_route.unit_ids,
+                    left_route.unit_ids + tuple(reversed(right_route.unit_ids)),
+                    tuple(reversed(right_route.unit_ids)) + left_route.unit_ids,
+                    right_route.unit_ids + tuple(reversed(left_route.unit_ids)),
+                }
+                kept_routes = [route for idx, route in enumerate(routes) if idx not in {left_idx, right_idx}]
+                base_pair_cost = route_evals[left_idx].best_cost + route_evals[right_idx].best_cost
+                for vehicle_type in common_vehicle_types:
+                    projected_count = (
+                        route_counts[vehicle_type]
+                        + 1
+                        - int(left_route.vehicle_type == vehicle_type)
+                        - int(right_route.vehicle_type == vehicle_type)
+                    )
+                    if projected_count > self.vehicle_by_name[vehicle_type].vehicle_count:
+                        continue
+                    for unit_ids in sequences:
+                        candidate_route = TypedRoute(vehicle_type=vehicle_type, unit_ids=unit_ids)
+                        route_eval = self.evaluate_route(candidate_route)
+                        if not route_eval.feasible:
+                            continue
+                        if route_eval.best_cost <= base_pair_cost + ROUTE_MERGE_COST_ALLOWANCE:
+                            return True, kept_routes + [candidate_route]
+        return False, routes
+
     def _try_route_type_change(self, routes: list[TypedRoute]) -> tuple[bool, list[TypedRoute]]:
+        route_counts = Counter(route.vehicle_type for route in routes)
         for idx, route in enumerate(routes):
             current_eval = self.evaluate_route(route)
             current_units = [self.unit_by_id[unit_id] for unit_id in route.unit_ids]
@@ -1398,10 +2302,15 @@ class Question1Solver:
             for vehicle_type in sorted(candidate_vehicle_types, key=lambda name: self.vehicle_size_rank[name]):
                 candidate_route = TypedRoute(vehicle_type, route.unit_ids)
                 candidate_eval = self.evaluate_route(candidate_route)
-                if candidate_eval.feasible and candidate_eval.best_cost + 1e-6 < current_eval.best_cost:
-                    updated = list(routes)
-                    updated[idx] = candidate_route
-                    if self.evaluate_solution(updated) is not None:
+                if candidate_eval.feasible:
+                    projected_count = route_counts[vehicle_type] + 1
+                    if route.vehicle_type == vehicle_type:
+                        projected_count -= 1
+                    if projected_count > self.vehicle_by_name[vehicle_type].vehicle_count:
+                        continue
+                    if candidate_eval.best_cost <= current_eval.best_cost + ROUTE_TYPE_CHANGE_COST_ALLOWANCE:
+                        updated = list(routes)
+                        updated[idx] = candidate_route
                         return True, updated
         return False, routes
 
@@ -1410,16 +2319,40 @@ class Question1Solver:
         if base_eval is None:
             return False, routes
         base_cost = base_eval.total_cost
-        for source_idx, source_route in enumerate(routes):
+        route_evals = [self.evaluate_route(route) for route in routes]
+        prioritized_source_indices = sorted(
+            range(len(routes)),
+            key=lambda idx: (
+                0 if len(routes[idx].unit_ids) == 1 else 1 if len(routes[idx].unit_ids) == 2 else 2,
+                len(routes[idx].unit_ids),
+                idx,
+            ),
+        )[:RELOCATE_ROUTE_LIMIT]
+        for source_idx in prioritized_source_indices:
+            source_route = routes[source_idx]
             for position, unit_id in enumerate(source_route.unit_ids):
                 unit = self.unit_by_id[unit_id]
                 source_remainder = source_route.unit_ids[:position] + source_route.unit_ids[position + 1 :]
                 source_routes = list(routes)
+                new_source_eval = None
                 if source_remainder:
-                    source_routes[source_idx] = TypedRoute(source_route.vehicle_type, source_remainder)
+                    new_source_route = TypedRoute(source_route.vehicle_type, source_remainder)
+                    new_source_eval = self.evaluate_route(new_source_route)
+                    if not new_source_eval.feasible:
+                        continue
+                    source_routes[source_idx] = new_source_route
                 else:
                     source_routes.pop(source_idx)
-                for target_idx, target_route in enumerate(source_routes):
+                prioritized_target_indices = sorted(
+                    range(len(source_routes)),
+                    key=lambda idx: (
+                        0 if len(source_routes[idx].unit_ids) == 1 else 1 if len(source_routes[idx].unit_ids) == 2 else 2,
+                        len(source_routes[idx].unit_ids),
+                        idx,
+                    ),
+                )
+                for target_idx in prioritized_target_indices:
+                    target_route = source_routes[target_idx]
                     if target_route.vehicle_type not in unit.eligible_vehicle_types:
                         continue
                     if unit.orig_cust_id in self._route_customers(target_route):
@@ -1427,9 +2360,16 @@ class Question1Solver:
                     for insert_pos in range(len(target_route.unit_ids) + 1):
                         target_unit_ids = target_route.unit_ids[:insert_pos] + (unit_id,) + target_route.unit_ids[insert_pos:]
                         candidate_routes = list(source_routes)
-                        candidate_routes[target_idx] = TypedRoute(target_route.vehicle_type, target_unit_ids)
-                        candidate_eval = self.evaluate_solution(candidate_routes)
-                        if candidate_eval is not None and candidate_eval.total_cost + 1e-6 < base_cost:
+                        new_target_route = TypedRoute(target_route.vehicle_type, target_unit_ids)
+                        new_target_eval = self.evaluate_route(new_target_route)
+                        if not new_target_eval.feasible:
+                            continue
+                        candidate_routes[target_idx] = new_target_route
+                        local_cost = base_cost - route_evals[source_idx].best_cost - self.evaluate_route(target_route).best_cost
+                        if new_source_eval is not None:
+                            local_cost += new_source_eval.best_cost
+                        local_cost += new_target_eval.best_cost
+                        if local_cost <= base_cost + (0.0 if source_remainder else RELOCATE_REMOVE_COST_ALLOWANCE):
                             return True, candidate_routes
         return False, routes
 
@@ -1467,27 +2407,26 @@ class Question1Solver:
                             return True, candidate_routes
         return False, routes
 
-    def improve_solution(self, solution: list[TypedRoute]) -> list[TypedRoute]:
+    def improve_solution(self, solution: list[TypedRoute]) -> tuple[list[TypedRoute], dict[str, int]]:
         routes = [self._two_opt_route(route) for route in solution]
-        improved = True
-        loop_count = 0
-        while improved and loop_count < 3:
-            improved = False
-            changed, routes = self._try_route_type_change(routes)
-            if changed:
-                improved = True
-                loop_count += 1
-                continue
-            changed, routes = self._try_relocate(routes)
-            if changed:
-                improved = True
-                loop_count += 1
-                continue
-            changed, routes = self._try_swap(routes)
-            if changed:
-                improved = True
-            loop_count += 1
-        return [route for route in routes if route.unit_ids]
+        stats = {
+            "route_merge_success_count": 0,
+            "relocate_success_count": 0,
+            "route_type_change_success_count": 0,
+        }
+        changed, routes = self._try_route_merge(routes)
+        if changed:
+            stats["route_merge_success_count"] += 1
+        changed, routes = self._try_route_type_change(routes)
+        if changed:
+            stats["route_type_change_success_count"] += 1
+        changed, routes = self._try_relocate(routes)
+        if changed:
+            stats["relocate_success_count"] += 1
+        changed, routes = self._try_route_type_change(routes)
+        if changed:
+            stats["route_type_change_success_count"] += 1
+        return [route for route in routes if route.unit_ids], stats
 
     def _compute_remove_count(self, generation: int, rng: random.Random) -> int:
         cauchy_draw = rng.random()
@@ -1523,7 +2462,7 @@ class Question1Solver:
         repaired = self.repair_solution(partial_routes, removed)
         if repaired is None:
             return None, None, operator_name
-        improved = self.improve_solution(repaired)
+        improved, _ = self.improve_solution(repaired)
         evaluated = self.evaluate_solution(improved)
         return improved, evaluated, operator_name
 
@@ -1533,64 +2472,56 @@ class Question1Solver:
         best_solution_routes: list[TypedRoute] | None = None
         best_seed = None
         run_records: list[dict[str, object]] = []
+        best_operator_stats = {
+            "route_merge_success_count": 0,
+            "relocate_success_count": 0,
+            "route_type_change_success_count": 0,
+        }
         search_start = time.perf_counter()
 
         for seed in self.seed_list:
             rng = random.Random(seed)
-            particles: list[list[TypedRoute]] = []
-            particle_evals: list[SolutionEvaluation] = []
-            while len(particles) < self.particle_count:
+            seed_best_routes: list[TypedRoute] | None = None
+            seed_best_eval: SolutionEvaluation | None = None
+            seed_best_stats = {
+                "route_merge_success_count": 0,
+                "relocate_success_count": 0,
+                "route_type_change_success_count": 0,
+            }
+            for _ in range(self.particle_count):
                 candidate = self._build_initial_solution(rng)
-                candidate = self.improve_solution(candidate)
+                candidate, candidate_stats = self.improve_solution(candidate)
                 evaluated = self.evaluate_solution(candidate)
                 if evaluated is None:
                     continue
-                particles.append(candidate)
-                particle_evals.append(evaluated)
+                if seed_best_eval is None or self._solution_rank_key(evaluated) < self._solution_rank_key(seed_best_eval):
+                    seed_best_routes = candidate
+                    seed_best_eval = evaluated
+                    seed_best_stats = dict(candidate_stats)
 
-            seed_best_idx = min(range(len(particles)), key=lambda idx: self._solution_rank_key(particle_evals[idx]))
-            seed_best_routes = particles[seed_best_idx]
-            seed_best_eval = particle_evals[seed_best_idx]
+            if seed_best_eval is None or seed_best_routes is None:
+                continue
             seed_incumbent_eval = seed_best_eval
             if best_solution_eval is None or self._solution_rank_key(seed_best_eval) < self._solution_rank_key(best_solution_eval):
                 best_solution_eval = seed_best_eval
                 best_solution_routes = seed_best_routes
                 best_seed = seed
+                best_operator_stats = dict(seed_best_stats)
 
-            for generation in range(self.max_generations):
-                for idx in range(len(particles)):
-                    mutated_routes, mutated_eval, _ = self._mutate_particle(
-                        particles[idx],
-                        particle_evals[idx],
-                        generation,
-                        rng,
-                    )
-                    if mutated_routes is None or mutated_eval is None:
-                        continue
-                    delta = mutated_eval.total_cost - particle_evals[idx].total_cost
-                    if (
-                        self._solution_rank_key(mutated_eval) < self._solution_rank_key(particle_evals[idx])
-                        or delta < 0
-                        or rng.random() < self._safe_exp(-delta / ACCEPT_TEMPERATURE)
-                    ):
-                        particles[idx] = mutated_routes
-                        particle_evals[idx] = mutated_eval
-                        if self._solution_rank_key(mutated_eval) < self._solution_rank_key(seed_incumbent_eval):
-                            seed_incumbent_eval = mutated_eval
-                        if best_solution_eval is None or self._solution_rank_key(mutated_eval) < self._solution_rank_key(best_solution_eval):
-                            best_solution_eval = mutated_eval
-                            best_solution_routes = mutated_routes
-                            best_seed = seed
-
-                seed_best_idx = min(range(len(particles)), key=lambda idx: self._solution_rank_key(particle_evals[idx]))
-                seed_best_routes = particles[seed_best_idx]
-                seed_best_eval = particle_evals[seed_best_idx]
-                if self._solution_rank_key(seed_best_eval) < self._solution_rank_key(seed_incumbent_eval):
-                    seed_incumbent_eval = seed_best_eval
-                if best_solution_eval is None or self._solution_rank_key(seed_best_eval) < self._solution_rank_key(best_solution_eval):
-                    best_solution_eval = seed_best_eval
-                    best_solution_routes = seed_best_routes
+            for _ in range(max(self.max_generations - 1, 0)):
+                refined_routes, refined_stats = self.improve_solution(seed_best_routes)
+                refined_eval = self.evaluate_solution(refined_routes)
+                if refined_eval is None or self._solution_rank_key(refined_eval) >= self._solution_rank_key(seed_incumbent_eval):
+                    break
+                seed_best_routes = refined_routes
+                seed_incumbent_eval = refined_eval
+                for key, value in refined_stats.items():
+                    seed_best_stats[key] += value
+                if best_solution_eval is None or self._solution_rank_key(refined_eval) < self._solution_rank_key(best_solution_eval):
+                    best_solution_eval = refined_eval
+                    best_solution_routes = refined_routes
                     best_seed = seed
+                    best_operator_stats = dict(seed_best_stats)
 
             run_records.append(
                 {
@@ -1599,6 +2530,7 @@ class Question1Solver:
                     "route_count": seed_incumbent_eval.route_count,
                     "used_vehicle_count": seed_incumbent_eval.used_vehicle_count,
                     "split_customer_count": seed_incumbent_eval.split_customer_count,
+                    "single_stop_route_count": seed_incumbent_eval.single_stop_route_count,
                     "late_positive_stops": seed_incumbent_eval.late_positive_stops,
                     "latest_return_min": seed_incumbent_eval.latest_return_min,
                 }
@@ -1607,13 +2539,60 @@ class Question1Solver:
         if best_solution_eval is None or best_solution_routes is None:
             raise RuntimeError("Solver failed to produce a feasible solution")
 
+        baseline_solution_eval = best_solution_eval
+        baseline_solution_routes = list(best_solution_routes)
+        route_pool_routes, route_pool_stats = self._route_pool_optimize_solution(best_solution_routes)
+        route_pool_eval = self.evaluate_solution(route_pool_routes)
+        if route_pool_eval is None:
+            raise RuntimeError("Route-pool optimized solution became infeasible")
+        if (
+            route_pool_eval.route_count <= baseline_solution_eval.route_count
+            and route_pool_eval.single_stop_route_count <= baseline_solution_eval.single_stop_route_count
+            and self._route_pool_solution_key(route_pool_routes, route_pool_eval)
+            < self._route_pool_solution_key(best_solution_routes, best_solution_eval)
+        ):
+            best_solution_routes = route_pool_routes
+            best_solution_eval = route_pool_eval
+
         elapsed_sec = time.perf_counter() - search_start
+        final_route_counts = self._route_counts(best_solution_routes)
+        final_routes_with_flexible_units_on_big, final_flexible_units_on_big_routes = self._final_solution_structure_metrics(best_solution_routes)
+        final_current_single_pairs_feasible, final_current_single_pairs_inventory_feasible = self._current_single_pair_inventory_counts(best_solution_routes)
         metadata = {
             "best_seed": best_seed,
             "elapsed_sec": elapsed_sec,
             "run_records": run_records,
             "service_unit_count": len(self.service_units),
             "route_cache_size": len(self.route_cache._cache),
+            "mandatory_split_customer_count": self.service_unit_summary["mandatory_split_customer_count"],
+            "heavy_big_only_count": self.service_unit_summary["mandatory_heavy_big_only_count"],
+            "total_heavy_big_only_count": self.service_unit_summary["heavy_big_only_count"],
+            "normal_heavy_big_only_count": self.service_unit_summary["normal_heavy_big_only_count"],
+            "heavy_big_only_capacity": self.service_unit_summary["heavy_big_only_capacity"],
+            "big_vehicle_inventory": self.service_unit_summary["big_vehicle_inventory"],
+            "big_vehicle_reserve": self.service_unit_summary["big_vehicle_reserve"],
+            "fuel_3000_used_count": final_route_counts.get("fuel_3000", 0),
+            "fuel_3000_free_count": self._fuel_3000_free_count(final_route_counts),
+            "single_single_merge_feasible_pair_count": final_current_single_pairs_feasible,
+            "single_single_merge_inventory_blocked_pair_count": max(
+                final_current_single_pairs_feasible - final_current_single_pairs_inventory_feasible,
+                0,
+            ),
+            "reserve_repair_success_count": 0,
+            "batch_merge_success_count": 0,
+            "pre_merge_single_stop_route_count": baseline_solution_eval.single_stop_route_count,
+            "post_merge_single_stop_route_count": best_solution_eval.single_stop_route_count,
+            "merge_diagnostics_rows": route_pool_stats["route_pool_diagnostics_rows"],
+            "final_routes_with_flexible_units_on_big": final_routes_with_flexible_units_on_big,
+            "final_flexible_units_on_big_routes": final_flexible_units_on_big_routes,
+            "final_current_single_pairs_inventory_feasible": final_current_single_pairs_inventory_feasible,
+            "diagnostic_unlock_success_count": route_pool_stats["route_pool_release_success_count"],
+            "diagnostic_promotion_success_count": route_pool_stats["route_pool_promotion_success_count"],
+            "route_pool_candidate_count": route_pool_stats["route_pool_candidate_count"],
+            "route_pool_role_counts": route_pool_stats["route_pool_role_counts"],
+            "baseline_route_count": baseline_solution_eval.route_count,
+            "baseline_single_stop_route_count": baseline_solution_eval.single_stop_route_count,
+            **best_operator_stats,
         }
         self._write_outputs(best_solution_eval, best_solution_routes, metadata)
         return best_solution_eval, metadata
@@ -1737,6 +2716,11 @@ class Question1Solver:
         customer_aggregate_df.to_csv(self.output_root / "q1_customer_aggregate.csv", index=False, encoding=CSV_ENCODING)
         pd.DataFrame(service_unit_rows).to_csv(self.output_root / "q1_service_units.csv", index=False, encoding=CSV_ENCODING)
         pd.DataFrame(self.split_plan_rows).to_csv(self.output_root / "q1_split_plan.csv", index=False, encoding=CSV_ENCODING)
+        pd.DataFrame(metadata["merge_diagnostics_rows"]).to_csv(
+            self.output_root / "q1_merge_diagnostics.csv",
+            index=False,
+            encoding=CSV_ENCODING,
+        )
 
         stale_atom_path = self.output_root / "q1_atoms.csv"
         if stale_atom_path.exists():
@@ -1760,6 +2744,32 @@ class Question1Solver:
             "mandatory_split_customer_count": solution_eval.mandatory_split_customer_count,
             "mandatory_split_visit_count": solution_eval.mandatory_split_visit_count,
             "normal_customer_count": solution_eval.normal_customer_count,
+            "single_stop_route_count": solution_eval.single_stop_route_count,
+            "two_stop_route_count": solution_eval.two_stop_route_count,
+            "three_plus_route_count": solution_eval.three_plus_route_count,
+            "heavy_big_only_count": metadata["heavy_big_only_count"],
+            "total_heavy_big_only_count": metadata["total_heavy_big_only_count"],
+            "normal_heavy_big_only_count": metadata["normal_heavy_big_only_count"],
+            "heavy_big_only_capacity": metadata["heavy_big_only_capacity"],
+            "big_vehicle_inventory": metadata["big_vehicle_inventory"],
+            "big_vehicle_reserve": metadata["big_vehicle_reserve"],
+            "fuel_3000_used_count": metadata["fuel_3000_used_count"],
+            "fuel_3000_free_count": metadata["fuel_3000_free_count"],
+            "single_single_merge_feasible_pair_count": metadata["single_single_merge_feasible_pair_count"],
+            "single_single_merge_inventory_blocked_pair_count": metadata["single_single_merge_inventory_blocked_pair_count"],
+            "final_current_single_pairs_inventory_feasible": metadata["final_current_single_pairs_inventory_feasible"],
+            "final_routes_with_flexible_units_on_big": metadata["final_routes_with_flexible_units_on_big"],
+            "final_flexible_units_on_big_routes": metadata["final_flexible_units_on_big_routes"],
+            "diagnostic_unlock_success_count": metadata["diagnostic_unlock_success_count"],
+            "diagnostic_promotion_success_count": metadata["diagnostic_promotion_success_count"],
+            "route_pool_candidate_count": metadata["route_pool_candidate_count"],
+            "route_pool_role_counts": metadata["route_pool_role_counts"],
+            "baseline_route_count": metadata["baseline_route_count"],
+            "baseline_single_stop_route_count": metadata["baseline_single_stop_route_count"],
+            "reserve_repair_success_count": metadata["reserve_repair_success_count"],
+            "batch_merge_success_count": metadata["batch_merge_success_count"],
+            "pre_merge_single_stop_route_count": metadata["pre_merge_single_stop_route_count"],
+            "post_merge_single_stop_route_count": metadata["post_merge_single_stop_route_count"],
             "late_positive_stops": solution_eval.late_positive_stops,
             "max_late_min": solution_eval.max_late_min,
             "latest_return_min": solution_eval.latest_return_min,
@@ -1767,6 +2777,9 @@ class Question1Solver:
             "after_hours_return_count": solution_eval.after_hours_return_count,
             "after_hours_travel_km": solution_eval.after_hours_travel_km,
             "vehicle_type_usage": solution_eval.vehicle_type_usage,
+            "route_merge_success_count": metadata["route_merge_success_count"],
+            "relocate_success_count": metadata["relocate_success_count"],
+            "route_type_change_success_count": metadata["route_type_change_success_count"],
             "best_seed": metadata["best_seed"],
             "service_unit_count": metadata["service_unit_count"],
             "route_cache_size": metadata["route_cache_size"],
@@ -1797,6 +2810,32 @@ class Question1Solver:
             f"- Mandatory split customers: {solution_eval.mandatory_split_customer_count}",
             f"- Mandatory split visits: {solution_eval.mandatory_split_visit_count}",
             f"- Normal customers: {solution_eval.normal_customer_count}",
+            f"- Single-stop routes: {solution_eval.single_stop_route_count}",
+            f"- Two-stop routes: {solution_eval.two_stop_route_count}",
+            f"- Three-plus-stop routes: {solution_eval.three_plus_route_count}",
+            f"- Heavy big-only count: {metadata['heavy_big_only_count']}",
+            f"- Normal heavy big-only count: {metadata['normal_heavy_big_only_count']}",
+            f"- Total heavy big-only count: {metadata['total_heavy_big_only_count']}",
+            f"- Heavy big-only capacity: {metadata['heavy_big_only_capacity']}",
+            f"- Big-vehicle inventory: {metadata['big_vehicle_inventory']}",
+            f"- Big-vehicle reserve: {metadata['big_vehicle_reserve']}",
+            f"- Fuel 3000 used count: {metadata['fuel_3000_used_count']}",
+            f"- Fuel 3000 free count: {metadata['fuel_3000_free_count']}",
+            f"- Single-single merge feasible pair count: {metadata['single_single_merge_feasible_pair_count']}",
+            f"- Single-single merge inventory-blocked pair count: {metadata['single_single_merge_inventory_blocked_pair_count']}",
+            f"- Final current single-pairs inventory-feasible count: {metadata['final_current_single_pairs_inventory_feasible']}",
+            f"- Final routes with flexible units on big: {metadata['final_routes_with_flexible_units_on_big']}",
+            f"- Final flexible units on big routes: {metadata['final_flexible_units_on_big_routes']}",
+            f"- Diagnostic unlock success count: {metadata['diagnostic_unlock_success_count']}",
+            f"- Diagnostic promotion success count: {metadata['diagnostic_promotion_success_count']}",
+            f"- Route-pool candidate count: {metadata['route_pool_candidate_count']}",
+            f"- Route-pool role counts: {json.dumps(metadata['route_pool_role_counts'], ensure_ascii=False)}",
+            f"- Baseline route count: {metadata['baseline_route_count']}",
+            f"- Baseline single-stop route count: {metadata['baseline_single_stop_route_count']}",
+            f"- Reserve repair success count: {metadata['reserve_repair_success_count']}",
+            f"- Batch merge success count: {metadata['batch_merge_success_count']}",
+            f"- Pre-merge single-stop route count: {metadata['pre_merge_single_stop_route_count']}",
+            f"- Post-merge single-stop route count: {metadata['post_merge_single_stop_route_count']}",
             f"- Late-positive stops: {solution_eval.late_positive_stops}",
             f"- Max late: {solution_eval.max_late_min:.3f} min",
             f"- Latest return: {solution_eval.latest_return_min:.3f} min",
@@ -1804,6 +2843,9 @@ class Question1Solver:
             f"- After-hours return count: {solution_eval.after_hours_return_count}",
             f"- After-hours travel: {solution_eval.after_hours_travel_km:.3f} km",
             f"- Vehicle type usage: {json.dumps(solution_eval.vehicle_type_usage, ensure_ascii=False)}",
+            f"- Route merge successes: {metadata['route_merge_success_count']}",
+            f"- Relocate successes: {metadata['relocate_success_count']}",
+            f"- Route type change successes: {metadata['route_type_change_success_count']}",
             f"- Elapsed time: {metadata['elapsed_sec']:.2f} s",
             "",
             "## Per-Seed Best",
@@ -1812,6 +2854,7 @@ class Question1Solver:
             report_lines.append(
                 f"- Seed {item['seed']}: best cost {item['best_cost']:.3f}, routes {item['route_count']}, "
                 f"vehicles {item['used_vehicle_count']}, split customers {item['split_customer_count']}, "
+                f"single-stop routes {item['single_stop_route_count']}, "
                 f"late-positive stops {item['late_positive_stops']}, latest return {item['latest_return_min']:.3f}"
             )
         (self.output_root / "q1_run_report.md").write_text("\n".join(report_lines), encoding="utf-8")
@@ -1822,9 +2865,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--workspace", type=Path, default=Path.cwd())
     parser.add_argument("--input-root", type=Path, default=Path.cwd() / "preprocess_artifacts")
     parser.add_argument("--output-root", type=Path, default=Path.cwd() / "question1_artifacts")
-    parser.add_argument("--seed-list", type=str, default="11,29,47,71")
-    parser.add_argument("--max-generations", type=int, default=20)
-    parser.add_argument("--particle-count", type=int, default=4)
+    parser.add_argument("--seed-list", type=str, default="11")
+    parser.add_argument("--max-generations", type=int, default=2)
+    parser.add_argument("--particle-count", type=int, default=1)
     parser.add_argument("--top-route-candidates", type=int, default=8)
     return parser.parse_args()
 

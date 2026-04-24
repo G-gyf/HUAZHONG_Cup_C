@@ -2,32 +2,61 @@
 
 ## Run Summary
 - Best seed: 11
-- Service unit count: 170
-- Route count: 131
-- Used vehicle count: 131
-- Total cost: 91401.203
-- Startup cost: 52400.000
-- Energy cost: 31292.090
-- Carbon cost: 6775.034
-- Waiting cost: 622.096
-- Late cost: 311.983
-- Total late minutes: 374.380
-- Total fuel: 4685.187 L
-- Total electricity: 6161.476 kWh
-- Total carbon: 15020.071 kg
-- Total distance: 15370.942 km
+- Service unit count: 175
+- Route count: 132
+- Used vehicle count: 132
+- Total cost: 92442.098
+- Startup cost: 52800.000
+- Energy cost: 31868.060
+- Carbon cost: 6900.402
+- Waiting cost: 458.965
+- Late cost: 414.671
+- Total late minutes: 497.606
+- Total fuel: 4759.715 L
+- Total electricity: 6254.980 kWh
+- Total carbon: 15256.739 kg
+- Total distance: 15633.023 km
 - Split customers: 37
 - Mandatory split customers: 37
-- Mandatory split visits: 119
+- Mandatory split visits: 124
 - Normal customers: 51
-- Late-positive stops: 16
+- Single-stop routes: 101
+- Two-stop routes: 21
+- Three-plus-stop routes: 10
+- Heavy big-only count: 48
+- Normal heavy big-only count: 17
+- Total heavy big-only count: 65
+- Heavy big-only capacity: 48
+- Big-vehicle inventory: 70
+- Big-vehicle reserve: 5
+- Fuel 3000 used count: 60
+- Fuel 3000 free count: 0
+- Single-single merge feasible pair count: 1599
+- Single-single merge inventory-blocked pair count: 1599
+- Final current single-pairs inventory-feasible count: 0
+- Final routes with flexible units on big: 27
+- Final flexible units on big routes: 44
+- Diagnostic unlock success count: 4
+- Diagnostic promotion success count: 1
+- Route-pool candidate count: 2798
+- Route-pool role counts: {"current": 141, "seed": 132, "rigid_big": 130, "singleton": 578, "flex_small": 202, "promotion": 1988}
+- Baseline route count: 132
+- Baseline single-stop route count: 101
+- Reserve repair success count: 0
+- Batch merge success count: 0
+- Pre-merge single-stop route count: 101
+- Post-merge single-stop route count: 101
+- Late-positive stops: 20
 - Max late: 141.472 min
-- Latest return: 850.200 min
+- Latest return: 866.100 min
 - After-hours service count: 0
-- After-hours return count: 25
-- After-hours travel: 823.015 km
-- Vehicle type usage: {"ev_3000": 10, "fuel_3000": 60, "fuel_1500": 45, "ev_1250": 15, "fuel_1250": 1}
-- Elapsed time: 3.01 s
+- After-hours return count: 23
+- After-hours travel: 809.723 km
+- Vehicle type usage: {"ev_3000": 10, "fuel_3000": 60, "fuel_1500": 47, "ev_1250": 15}
+- Route merge successes: 0
+- Relocate successes: 0
+- Route type change successes: 2
+- Elapsed time: 7.88 s
 
 ## Per-Seed Best
-- Seed 11: best cost 91401.203, routes 131, vehicles 131, split customers 37, late-positive stops 16, latest return 850.200
+- Seed 11: best cost 92442.098, routes 132, vehicles 132, split customers 37, single-stop routes 101, late-positive stops 20, latest return 866.100

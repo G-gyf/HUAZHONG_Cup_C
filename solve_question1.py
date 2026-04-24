@@ -13,6 +13,8 @@ from typing import Iterable
 
 import numpy as np
 import pandas as pd
+from scipy.optimize import Bounds, LinearConstraint, milp
+from scipy.sparse import csc_matrix
 
 
 DAY_END_MIN = 780
@@ -46,6 +48,37 @@ ROUTE_TYPE_CHANGE_COST_ALLOWANCE = 80.0
 FUEL_3000_SEARCH_RESERVE = 1
 BATCH_MERGE_LIMIT = 1
 SINGLE_MERGE_SAMPLE_LIMIT = 24
+ROUTE_POOL_MAX_COLUMNS = 4000
+ROUTE_POOL_PROMOTION_LIMIT = 2000
+ROUTE_POOL_FLEX_SMALL_LIMIT = 1200
+ROUTE_POOL_PASS2_MAX_COLUMNS = 5000
+BASE_FLEX_SPATIAL_NEIGHBOR_LIMIT = 8
+BASE_FLEX_TW_NEIGHBOR_LIMIT = 8
+BASE_FLEX_NEIGHBOR_LIMIT = 12
+BASE_FLEX_TRIPLE_SEED_LIMIT = 5
+ROUTE_POOL_RESIDUAL_PROMOTION_LIMIT = 600
+ROUTE_POOL_RESIDUAL_FLEX_SMALL_LIMIT = 400
+RESIDUAL_SOURCE_LIMIT = 40
+RESIDUAL_SPATIAL_NEIGHBOR_LIMIT = 8
+RESIDUAL_TW_NEIGHBOR_LIMIT = 8
+RESIDUAL_NEIGHBOR_LIMIT = 16
+RESIDUAL_TRIPLE_PARTNER_LIMIT = 6
+RESIDUAL_PROMOTION_PER_SOURCE_LIMIT = 12
+RESIDUAL_FLEX_SMALL_PER_SOURCE_LIMIT = 8
+RESIDUAL_TW_OVERLAP_MIN = 30.0
+PASS3_SOURCE_LIMIT = 64
+PASS3_TRIPLE_PARTNER_LIMIT = 5
+PASS3_FLEX_SMALL_PAIR_PER_SOURCE_LIMIT = 8
+PASS3_FLEX_SMALL_TRIPLE_PER_SOURCE_LIMIT = 6
+PASS3_FLEX_SMALL_QUAD_PER_SOURCE_LIMIT = 4
+PASS3_CLUSTER_ROUTE_LIMIT = 4
+PASS3_CLUSTER_PARTNER_UNIT_LIMIT = 7
+BIG_ROUTE_SOFT_PENALTY = 10.0
+MILP_PHASE_TIME_LIMIT_SEC = 60
+MILP_REL_GAP = 0.0
+ROUTE_POOL_PIGGYBACK_BIG_LIMIT = 500
+COST_FIRST_ROUTE_POOL_ITERATIONS = 2
+COST_IMPROVEMENT_EPS = 1e-6
 
 
 @dataclass(frozen=True)
@@ -196,6 +229,8 @@ class Question1Solver:
         max_generations: int,
         particle_count: int,
         top_route_candidates: int,
+        packing_strategy: str = "baseline",
+        enable_split_packing_sensitivity: bool = True,
     ) -> None:
         self.workspace = workspace
         self.input_root = input_root
@@ -204,6 +239,8 @@ class Question1Solver:
         self.max_generations = max_generations
         self.particle_count = particle_count
         self.top_route_candidates = top_route_candidates
+        self.packing_strategy = packing_strategy
+        self.enable_split_packing_sensitivity = enable_split_packing_sensitivity
 
         tables_root = self.input_root / "tables"
         self.customer_master = pd.read_csv(tables_root / "customer_master_98.csv")
@@ -272,6 +309,21 @@ class Question1Solver:
         self.route_cache = RouteCache()
         self.enable_fuel_3000_reserve = False
 
+    def _packing_candidate_sort_key(self, item: dict[str, object]) -> tuple[int, int, int, int]:
+        if self.packing_strategy == "reduced_big_dependency":
+            return (
+                int(item["heavy_big_only_count"]),
+                int(item["big_only_count"]),
+                int(item["visit_count"]),
+                -int(item["eligible_sum"]),
+            )
+        return (
+            int(item["visit_count"]),
+            int(item["heavy_big_only_count"]),
+            int(item["big_only_count"]),
+            -int(item["eligible_sum"]),
+        )
+
     def _route_counts(self, routes: list[TypedRoute]) -> Counter[str]:
         return Counter(route.vehicle_type for route in routes)
 
@@ -293,6 +345,36 @@ class Question1Solver:
     def _unit_is_heavy_big_only(self, unit_id: int) -> bool:
         unit = self.unit_by_id[unit_id]
         return self._is_heavy_big_only_unit(unit.weight, unit.volume, unit.eligible_vehicle_types)
+
+    def _route_big_structure_metrics(self, route: TypedRoute) -> tuple[int, int, int, int, int, int, int]:
+        if route.vehicle_type not in {"fuel_3000", "ev_3000"}:
+            return 0, 0, 0, 0, 0, 0, 0
+        flexible_unit_count = sum(1 for unit_id in route.unit_ids if not self._unit_is_heavy_big_only(unit_id))
+        heavy_big_only_unit_count = len(route.unit_ids) - flexible_unit_count
+        promotion_like_big_route_flag = int(
+            len(route.unit_ids) >= 2
+            and flexible_unit_count == len(route.unit_ids)
+            and flexible_unit_count > 0
+        )
+        piggyback_big_route_flag = int(
+            heavy_big_only_unit_count >= 1
+            and 1 <= flexible_unit_count <= 1
+        )
+        blocking_big_flexible_route_flag = int(
+            flexible_unit_count > 0
+            and not promotion_like_big_route_flag
+            and not piggyback_big_route_flag
+        )
+        blocking_big_flexible_unit_count = flexible_unit_count if blocking_big_flexible_route_flag else 0
+        return (
+            promotion_like_big_route_flag,
+            piggyback_big_route_flag,
+            blocking_big_flexible_route_flag,
+            blocking_big_flexible_unit_count,
+            1,
+            flexible_unit_count,
+            heavy_big_only_unit_count,
+        )
 
     def _route_big_flexible_metrics(self, route: TypedRoute) -> tuple[int, int, int]:
         if route.vehicle_type not in {"fuel_3000", "ev_3000"}:
@@ -340,11 +422,24 @@ class Question1Solver:
             metric_tuple[2],
         )
 
+    def _solution_big_route_diagnostics(self, routes: Iterable[TypedRoute]) -> dict[str, int]:
+        route_metrics = [self._route_big_structure_metrics(route) for route in routes]
+        return {
+            "promotion_like_big_count": int(sum(item[0] for item in route_metrics)),
+            "piggyback_big_count": int(sum(item[1] for item in route_metrics)),
+            "blocking_big_flexible_count": int(sum(item[2] for item in route_metrics)),
+            "blocking_big_flexible_unit_count": int(sum(item[3] for item in route_metrics)),
+            "big_route_count": int(sum(item[4] for item in route_metrics)),
+            "mixed_big_route_count": int(sum(int(item[5] > 0) for item in route_metrics)),
+            "mixed_big_flexible_unit_count": int(sum(item[5] for item in route_metrics)),
+            "heavy_big_only_unit_count": int(sum(item[6] for item in route_metrics)),
+        }
+
     def _final_solution_structure_metrics(self, routes: list[TypedRoute]) -> tuple[int, int]:
-        route_metrics = [self._route_big_flexible_metrics(route) for route in routes]
+        diagnostics = self._solution_big_route_diagnostics(routes)
         return (
-            int(sum(item[0] for item in route_metrics)),
-            int(sum(item[1] for item in route_metrics)),
+            diagnostics["blocking_big_flexible_count"],
+            diagnostics["blocking_big_flexible_unit_count"],
         )
 
     def _preserves_fuel_3000_reserve(
@@ -408,6 +503,39 @@ class Question1Solver:
                 time_gap = abs(tw_mid.get(left, 0.0) - tw_mid.get(right, 0.0)) / 60.0
                 affinity[self.customer_index[left], self.customer_index[right]] = distance + 2.5 * time_gap
         return affinity
+
+    def _time_window_overlap_minutes(self, left_unit_id: int, right_unit_id: int) -> float:
+        left_unit = self.unit_by_id[left_unit_id]
+        right_unit = self.unit_by_id[right_unit_id]
+        return max(
+            0.0,
+            min(float(left_unit.tw_end_min), float(right_unit.tw_end_min))
+            - max(float(left_unit.tw_start_min), float(right_unit.tw_start_min)),
+        )
+
+    def _average_time_window_overlap_minutes(self, unit_ids: Iterable[int]) -> float:
+        unit_ids = tuple(unit_ids)
+        if len(unit_ids) <= 1:
+            return 0.0
+        overlap_values = [
+            self._time_window_overlap_minutes(left_unit_id, right_unit_id)
+            for left_unit_id, right_unit_id in combinations(unit_ids, 2)
+        ]
+        if not overlap_values:
+            return 0.0
+        return float(sum(overlap_values) / len(overlap_values))
+
+    def _average_customer_distance_km(self, unit_ids: Iterable[int]) -> float:
+        customer_ids = tuple(self.unit_by_id[unit_id].orig_cust_id for unit_id in unit_ids)
+        if len(customer_ids) <= 1:
+            return 0.0
+        distance_values = [
+            self._distance_between(left_customer_id, right_customer_id)
+            for left_customer_id, right_customer_id in combinations(customer_ids, 2)
+        ]
+        if not distance_values:
+            return 0.0
+        return float(sum(distance_values) / len(distance_values))
 
     def _build_customer_neighbors(self) -> dict[int, list[int]]:
         neighbors: dict[int, list[int]] = {}
@@ -634,14 +762,7 @@ class Question1Solver:
                 )
             if not candidate_packings:
                 raise RuntimeError(f"Unable to build packing candidates for mandatory split customer {cust_id}")
-            candidate_packings.sort(
-                key=lambda item: (
-                    item["visit_count"],
-                    item["heavy_big_only_count"],
-                    item["big_only_count"],
-                    -item["eligible_sum"],
-                )
-            )
+            candidate_packings.sort(key=self._packing_candidate_sort_key)
             mandatory_customers.append(
                 {
                     "cust_id": cust_id,
@@ -1291,16 +1412,15 @@ class Question1Solver:
             assigned_routes=assigned_routes,
         )
 
-    def _solution_rank_key(self, solution_eval: SolutionEvaluation) -> tuple[int, int, int, int, float, float, float]:
+    def _solution_rank_key(self, solution_eval: SolutionEvaluation) -> tuple[float, int, int, int, float, float]:
         structural_split_gap = abs(
             solution_eval.split_customer_count - solution_eval.mandatory_split_customer_count
         )
         return (
-            structural_split_gap,
-            solution_eval.single_stop_route_count,
-            solution_eval.used_vehicle_count,
-            solution_eval.split_customer_count,
             round(solution_eval.total_cost, 6),
+            structural_split_gap,
+            solution_eval.route_count,
+            solution_eval.single_stop_route_count,
             round(solution_eval.total_late_min, 6),
             round(solution_eval.total_carbon_kg, 6),
         )
@@ -1748,13 +1868,30 @@ class Question1Solver:
         flexible_neighbors: dict[int, list[int]] = {}
         for unit_id in flexible_unit_ids:
             unit = self.unit_by_id[unit_id]
-            neighbor_units: list[int] = []
-            for cust_id in self.customer_neighbors.get(unit.orig_cust_id, [])[:6]:
+            spatial_neighbor_ids: list[int] = []
+            for cust_id in self.customer_neighbors.get(unit.orig_cust_id, []):
                 for neighbor_unit_id in units_by_customer.get(cust_id, []):
                     if neighbor_unit_id != unit_id and not self._unit_is_heavy_big_only(neighbor_unit_id):
-                        neighbor_units.append(neighbor_unit_id)
-            # Keep deterministic order and avoid duplicates.
-            flexible_neighbors[unit_id] = list(dict.fromkeys(neighbor_units))[:6]
+                        spatial_neighbor_ids.append(neighbor_unit_id)
+                if len(dict.fromkeys(spatial_neighbor_ids)) >= BASE_FLEX_SPATIAL_NEIGHBOR_LIMIT:
+                    break
+            spatial_neighbor_ids = list(dict.fromkeys(spatial_neighbor_ids))[:BASE_FLEX_SPATIAL_NEIGHBOR_LIMIT]
+            tw_neighbor_ids = [
+                neighbor_unit_id
+                for neighbor_unit_id in flexible_unit_ids
+                if neighbor_unit_id != unit_id
+                and self.unit_by_id[neighbor_unit_id].orig_cust_id != unit.orig_cust_id
+                and self._time_window_overlap_minutes(unit_id, neighbor_unit_id) >= RESIDUAL_TW_OVERLAP_MIN
+            ]
+            tw_neighbor_ids.sort(
+                key=lambda neighbor_unit_id: (
+                    -self._time_window_overlap_minutes(unit_id, neighbor_unit_id),
+                    self._distance_between(unit.orig_cust_id, self.unit_by_id[neighbor_unit_id].orig_cust_id),
+                    neighbor_unit_id,
+                )
+            )
+            tw_neighbor_ids = tw_neighbor_ids[:BASE_FLEX_TW_NEIGHBOR_LIMIT]
+            flexible_neighbors[unit_id] = list(dict.fromkeys(spatial_neighbor_ids + tw_neighbor_ids))[:BASE_FLEX_NEIGHBOR_LIMIT]
 
         heavy_neighbors: dict[int, list[int]] = {}
         for unit_id in heavy_unit_ids:
@@ -1765,6 +1902,35 @@ class Question1Solver:
                     if neighbor_unit_id != unit_id and self._unit_is_heavy_big_only(neighbor_unit_id):
                         neighbor_units.append(neighbor_unit_id)
             heavy_neighbors[unit_id] = list(dict.fromkeys(neighbor_units))[:4]
+
+        heavy_flexible_neighbors: dict[int, list[int]] = {}
+        for unit_id in heavy_unit_ids:
+            unit = self.unit_by_id[unit_id]
+            spatial_neighbor_ids: list[int] = []
+            for cust_id in self.customer_neighbors.get(unit.orig_cust_id, []):
+                for neighbor_unit_id in units_by_customer.get(cust_id, []):
+                    if neighbor_unit_id != unit_id and not self._unit_is_heavy_big_only(neighbor_unit_id):
+                        spatial_neighbor_ids.append(neighbor_unit_id)
+                if len(dict.fromkeys(spatial_neighbor_ids)) >= BASE_FLEX_SPATIAL_NEIGHBOR_LIMIT:
+                    break
+            spatial_neighbor_ids = list(dict.fromkeys(spatial_neighbor_ids))[:BASE_FLEX_SPATIAL_NEIGHBOR_LIMIT]
+            tw_neighbor_ids = [
+                neighbor_unit_id
+                for neighbor_unit_id in flexible_unit_ids
+                if self.unit_by_id[neighbor_unit_id].orig_cust_id != unit.orig_cust_id
+                and self._time_window_overlap_minutes(unit_id, neighbor_unit_id) >= RESIDUAL_TW_OVERLAP_MIN
+            ]
+            tw_neighbor_ids.sort(
+                key=lambda neighbor_unit_id: (
+                    -self._time_window_overlap_minutes(unit_id, neighbor_unit_id),
+                    self._distance_between(unit.orig_cust_id, self.unit_by_id[neighbor_unit_id].orig_cust_id),
+                    neighbor_unit_id,
+                )
+            )
+            tw_neighbor_ids = tw_neighbor_ids[:BASE_FLEX_TW_NEIGHBOR_LIMIT]
+            heavy_flexible_neighbors[unit_id] = list(
+                dict.fromkeys(spatial_neighbor_ids + tw_neighbor_ids)
+            )[:BASE_FLEX_NEIGHBOR_LIMIT]
 
         for unit_id in flexible_unit_ids:
             unit = self.unit_by_id[unit_id]
@@ -1779,7 +1945,7 @@ class Question1Solver:
                     for vehicle_type in small_vehicle_types
                     if vehicle_type in unit.eligible_vehicle_types and vehicle_type in neighbor_unit.eligible_vehicle_types
                 ]
-                for vehicle_type in common_small_types[:2]:
+                for vehicle_type in common_small_types:
                     for ordered_unit_ids in ((unit_id, neighbor_unit_id), (neighbor_unit_id, unit_id)):
                         self._register_candidate_route(route_pool, vehicle_type, ordered_unit_ids, "flex_small")
                 common_big_types = [
@@ -1794,7 +1960,7 @@ class Question1Solver:
         for unit_id in flexible_unit_ids:
             unit = self.unit_by_id[unit_id]
             triple_candidates = [neighbor_unit_id for neighbor_unit_id in flexible_neighbors[unit_id] if neighbor_unit_id > unit_id]
-            for left_neighbor_id, right_neighbor_id in combinations(triple_candidates[:4], 2):
+            for left_neighbor_id, right_neighbor_id in combinations(triple_candidates[:BASE_FLEX_TRIPLE_SEED_LIMIT], 2):
                 left_neighbor = self.unit_by_id[left_neighbor_id]
                 right_neighbor = self.unit_by_id[right_neighbor_id]
                 if len({unit.orig_cust_id, left_neighbor.orig_cust_id, right_neighbor.orig_cust_id}) < 3:
@@ -1814,8 +1980,8 @@ class Question1Solver:
                     and vehicle_type in right_neighbor.eligible_vehicle_types
                 ]
                 for ordered_unit_ids in permutations((unit_id, left_neighbor_id, right_neighbor_id)):
-                    if common_small_types:
-                        self._register_candidate_route(route_pool, common_small_types[0], tuple(ordered_unit_ids), "flex_small")
+                    for vehicle_type in common_small_types[:2]:
+                        self._register_candidate_route(route_pool, vehicle_type, tuple(ordered_unit_ids), "flex_small")
                     for vehicle_type in common_big_types:
                         self._register_candidate_route(route_pool, vehicle_type, tuple(ordered_unit_ids), "promotion")
 
@@ -1835,6 +2001,30 @@ class Question1Solver:
                 for vehicle_type in common_big_types:
                     for ordered_unit_ids in ((unit_id, neighbor_unit_id), (neighbor_unit_id, unit_id)):
                         self._register_candidate_route(route_pool, vehicle_type, ordered_unit_ids, "rigid_big")
+            for flexible_unit_id in heavy_flexible_neighbors[unit_id]:
+                flexible_unit = self.unit_by_id[flexible_unit_id]
+                common_big_types = [
+                    vehicle_type
+                    for vehicle_type in big_vehicle_types
+                    if vehicle_type in unit.eligible_vehicle_types and vehicle_type in flexible_unit.eligible_vehicle_types
+                ]
+                for vehicle_type in common_big_types:
+                    for ordered_unit_ids in ((unit_id, flexible_unit_id), (flexible_unit_id, unit_id)):
+                        self._register_candidate_route(route_pool, vehicle_type, ordered_unit_ids, "piggyback_big")
+                for heavy_neighbor_id in heavy_neighbors[unit_id]:
+                    if unit_id >= heavy_neighbor_id:
+                        continue
+                    heavy_neighbor = self.unit_by_id[heavy_neighbor_id]
+                    triple_vehicle_types = [
+                        vehicle_type
+                        for vehicle_type in big_vehicle_types
+                        if vehicle_type in unit.eligible_vehicle_types
+                        and vehicle_type in heavy_neighbor.eligible_vehicle_types
+                        and vehicle_type in flexible_unit.eligible_vehicle_types
+                    ]
+                    for vehicle_type in triple_vehicle_types:
+                        for ordered_unit_ids in permutations((unit_id, heavy_neighbor_id, flexible_unit_id)):
+                            self._register_candidate_route(route_pool, vehicle_type, tuple(ordered_unit_ids), "piggyback_big")
         return route_pool
 
     def _route_pool_role_counts(
@@ -1846,6 +2036,1089 @@ class Question1Solver:
             for role in spec.roles:
                 role_counts[role] += 1
         return dict(role_counts)
+
+    @staticmethod
+    def _column_has_any_role(column: dict[str, object], role_names: set[str]) -> bool:
+        return bool(set(column["roles"]) & role_names)
+
+    @staticmethod
+    def _column_pool_pass(roles: Iterable[str]) -> str:
+        return "residual" if any(role.startswith("residual_") for role in roles) else "base"
+
+    def _column_effective_saving(self, column: dict[str, object]) -> float:
+        return float(column["current_cost_saving"])
+
+    def _column_candidate_score(self, column: dict[str, object]) -> float:
+        return float(
+            self._column_effective_saving(column)
+            + 0.25 * float(column["avg_time_window_overlap_min"])
+            - 0.10 * float(column["avg_customer_distance_km"])
+        )
+
+    def _column_candidate_sort_key(self, column: dict[str, object]) -> tuple[float, float, float, int, float, str, tuple[int, ...]]:
+        return (
+            -float(column["current_cost_saving"]),
+            -float(column["avg_time_window_overlap_min"]),
+            float(column["avg_customer_distance_km"]),
+            -int(column["unit_count"]),
+            float(column["best_cost"]),
+            str(column["vehicle_type"]),
+            tuple(int(unit_id) for unit_id in column["unit_ids"]),
+        )
+
+    def _flex_small_count_by_size(
+        self,
+        columns: Iterable[dict[str, object]],
+    ) -> dict[str, int]:
+        counts = Counter[int]()
+        for column in columns:
+            if self._column_has_any_role(column, {"flex_small", "residual_flex_small", "cluster_flex_small"}):
+                counts[int(column["unit_count"])] += 1
+        return {str(size): count for size, count in sorted(counts.items())}
+
+    def _best_route_candidate_for_units(
+        self,
+        vehicle_types: Iterable[str],
+        unit_ids: tuple[int, ...],
+    ) -> tuple[str, tuple[int, ...], RouteEvaluation] | None:
+        best_candidate: tuple[str, tuple[int, ...], RouteEvaluation] | None = None
+        for vehicle_type in vehicle_types:
+            for ordered_unit_ids in permutations(unit_ids):
+                route = TypedRoute(vehicle_type=vehicle_type, unit_ids=tuple(ordered_unit_ids))
+                route_eval = self.evaluate_route(route)
+                if not route_eval.feasible:
+                    continue
+                candidate = (vehicle_type, tuple(ordered_unit_ids), route_eval)
+                if best_candidate is None or (
+                    route_eval.best_cost,
+                    vehicle_type,
+                    tuple(ordered_unit_ids),
+                ) < (
+                    best_candidate[2].best_cost,
+                    best_candidate[0],
+                    best_candidate[1],
+                ):
+                    best_candidate = candidate
+        return best_candidate
+
+    def _rank_residual_source_unit_ids(
+        self,
+        source_unit_ids: Iterable[int],
+        singleton_cost_by_unit: dict[int, float],
+        source_limit: int,
+    ) -> list[int]:
+        source_unit_ids = list(source_unit_ids)
+        overlap_potential_cache: dict[int, float] = {}
+        distance_centrality_cache: dict[int, float] = {}
+        for unit_id in source_unit_ids:
+            other_unit_ids = [other_unit_id for other_unit_id in source_unit_ids if other_unit_id != unit_id]
+            overlap_potential_cache[unit_id] = max(
+                (self._time_window_overlap_minutes(unit_id, other_unit_id) for other_unit_id in other_unit_ids),
+                default=0.0,
+            )
+            nearest_distances = sorted(
+                self._distance_between(self.unit_by_id[unit_id].orig_cust_id, self.unit_by_id[other_unit_id].orig_cust_id)
+                for other_unit_id in other_unit_ids
+            )[:3]
+            distance_centrality_cache[unit_id] = (
+                float(sum(nearest_distances) / len(nearest_distances))
+                if nearest_distances
+                else np.inf
+            )
+        return sorted(
+            source_unit_ids,
+            key=lambda unit_id: (
+                -singleton_cost_by_unit[unit_id],
+                -overlap_potential_cache[unit_id],
+                distance_centrality_cache[unit_id],
+                self.unit_by_id[unit_id].orig_cust_id,
+                unit_id,
+            ),
+        )[:source_limit]
+
+    def _residual_candidate_neighbor_ids(
+        self,
+        source_unit_id: int,
+        candidate_unit_ids: Iterable[int],
+        units_by_customer: dict[int, list[int]],
+        singleton_cost_by_unit: dict[int, float],
+        spatial_limit: int,
+        tw_limit: int,
+        neighbor_limit: int,
+    ) -> list[int]:
+        source_unit = self.unit_by_id[source_unit_id]
+        spatial_neighbor_ids: list[int] = []
+        for cust_id in self.customer_neighbors.get(source_unit.orig_cust_id, []):
+            for neighbor_unit_id in units_by_customer.get(cust_id, []):
+                if neighbor_unit_id == source_unit_id:
+                    continue
+                if self.unit_by_id[neighbor_unit_id].orig_cust_id == source_unit.orig_cust_id:
+                    continue
+                spatial_neighbor_ids.append(neighbor_unit_id)
+            if len(dict.fromkeys(spatial_neighbor_ids)) >= spatial_limit:
+                break
+        spatial_neighbor_ids = list(dict.fromkeys(spatial_neighbor_ids))[:spatial_limit]
+
+        tw_neighbor_ids = [
+            unit_id
+            for unit_id in candidate_unit_ids
+            if unit_id != source_unit_id
+            and self.unit_by_id[unit_id].orig_cust_id != source_unit.orig_cust_id
+            and self._time_window_overlap_minutes(source_unit_id, unit_id) >= RESIDUAL_TW_OVERLAP_MIN
+        ]
+        tw_neighbor_ids.sort(
+            key=lambda unit_id: (
+                -self._time_window_overlap_minutes(source_unit_id, unit_id),
+                self._distance_between(source_unit.orig_cust_id, self.unit_by_id[unit_id].orig_cust_id),
+                -singleton_cost_by_unit[unit_id],
+                unit_id,
+            )
+        )
+        tw_neighbor_ids = tw_neighbor_ids[:tw_limit]
+        return list(dict.fromkeys(spatial_neighbor_ids + tw_neighbor_ids))[:neighbor_limit]
+
+    def _augment_route_pool_with_residual_candidates(
+        self,
+        route_pool: dict[tuple[str, tuple[int, ...]], CandidateRouteSpec],
+        residual_source_routes: list[TypedRoute],
+    ) -> dict[tuple[str, tuple[int, ...]], float]:
+        singleton_cost_by_unit = {
+            route.unit_ids[0]: self.evaluate_route(route).best_cost
+            for route in residual_source_routes
+            if len(route.unit_ids) == 1 and not self._unit_is_heavy_big_only(route.unit_ids[0])
+        }
+        residual_unit_ids = list(singleton_cost_by_unit)
+        residual_units_by_customer: dict[int, list[int]] = defaultdict(list)
+        for unit_id in residual_unit_ids:
+            residual_units_by_customer[self.unit_by_id[unit_id].orig_cust_id].append(unit_id)
+
+        ranked_source_unit_ids = self._rank_residual_source_unit_ids(
+            source_unit_ids=residual_unit_ids,
+            singleton_cost_by_unit=singleton_cost_by_unit,
+            source_limit=RESIDUAL_SOURCE_LIMIT,
+        )
+
+        residual_saving_by_key: dict[tuple[str, tuple[int, ...]], float] = {}
+        small_vehicle_types = ("fuel_1250", "ev_1250", "fuel_1500")
+        big_vehicle_types = ("fuel_3000", "ev_3000")
+
+        for source_unit_id in ranked_source_unit_ids:
+            source_unit = self.unit_by_id[source_unit_id]
+            candidate_neighbor_ids = self._residual_candidate_neighbor_ids(
+                source_unit_id=source_unit_id,
+                candidate_unit_ids=residual_unit_ids,
+                units_by_customer=residual_units_by_customer,
+                singleton_cost_by_unit=singleton_cost_by_unit,
+                spatial_limit=RESIDUAL_SPATIAL_NEIGHBOR_LIMIT,
+                tw_limit=RESIDUAL_TW_NEIGHBOR_LIMIT,
+                neighbor_limit=RESIDUAL_NEIGHBOR_LIMIT,
+            )
+            if not candidate_neighbor_ids:
+                continue
+
+            residual_promotion_records: list[tuple[float, float, float, float, str, tuple[int, ...]]] = []
+            residual_flex_small_records: list[tuple[float, float, float, float, str, tuple[int, ...]]] = []
+            partner_best_saving: dict[int, float] = {}
+
+            for neighbor_unit_id in candidate_neighbor_ids:
+                neighbor_unit = self.unit_by_id[neighbor_unit_id]
+                avg_overlap = self._average_time_window_overlap_minutes((source_unit_id, neighbor_unit_id))
+                avg_distance = self._average_customer_distance_km((source_unit_id, neighbor_unit_id))
+                common_small_types = [
+                    vehicle_type
+                    for vehicle_type in small_vehicle_types
+                    if vehicle_type in source_unit.eligible_vehicle_types and vehicle_type in neighbor_unit.eligible_vehicle_types
+                ]
+                common_big_types = [
+                    vehicle_type
+                    for vehicle_type in big_vehicle_types
+                    if vehicle_type in source_unit.eligible_vehicle_types and vehicle_type in neighbor_unit.eligible_vehicle_types
+                ]
+                if common_small_types:
+                    best_candidate = self._best_route_candidate_for_units(common_small_types, (source_unit_id, neighbor_unit_id))
+                    if best_candidate is not None:
+                        vehicle_type, ordered_unit_ids, route_eval = best_candidate
+                        saving = singleton_cost_by_unit[source_unit_id] + singleton_cost_by_unit[neighbor_unit_id] - route_eval.best_cost
+                        residual_flex_small_records.append((saving, avg_overlap, avg_distance, route_eval.best_cost, vehicle_type, ordered_unit_ids))
+                        partner_best_saving[neighbor_unit_id] = max(partner_best_saving.get(neighbor_unit_id, -np.inf), saving)
+                if common_big_types:
+                    best_candidate = self._best_route_candidate_for_units(common_big_types, (source_unit_id, neighbor_unit_id))
+                    if best_candidate is not None:
+                        vehicle_type, ordered_unit_ids, route_eval = best_candidate
+                        saving = singleton_cost_by_unit[source_unit_id] + singleton_cost_by_unit[neighbor_unit_id] - route_eval.best_cost
+                        residual_promotion_records.append((saving, avg_overlap, avg_distance, route_eval.best_cost, vehicle_type, ordered_unit_ids))
+                        partner_best_saving[neighbor_unit_id] = max(partner_best_saving.get(neighbor_unit_id, -np.inf), saving)
+
+            top_partner_ids = [
+                neighbor_unit_id
+                for neighbor_unit_id, _ in sorted(
+                    partner_best_saving.items(),
+                    key=lambda item: (
+                        -item[1],
+                        self._distance_between(source_unit.orig_cust_id, self.unit_by_id[item[0]].orig_cust_id),
+                        item[0],
+                    ),
+                )[:RESIDUAL_TRIPLE_PARTNER_LIMIT]
+            ]
+
+            for left_neighbor_id, right_neighbor_id in combinations(top_partner_ids, 2):
+                left_neighbor = self.unit_by_id[left_neighbor_id]
+                right_neighbor = self.unit_by_id[right_neighbor_id]
+                if len({source_unit.orig_cust_id, left_neighbor.orig_cust_id, right_neighbor.orig_cust_id}) < 3:
+                    continue
+                common_small_types = [
+                    vehicle_type
+                    for vehicle_type in small_vehicle_types
+                    if vehicle_type in source_unit.eligible_vehicle_types
+                    and vehicle_type in left_neighbor.eligible_vehicle_types
+                    and vehicle_type in right_neighbor.eligible_vehicle_types
+                ]
+                common_big_types = [
+                    vehicle_type
+                    for vehicle_type in big_vehicle_types
+                    if vehicle_type in source_unit.eligible_vehicle_types
+                    and vehicle_type in left_neighbor.eligible_vehicle_types
+                    and vehicle_type in right_neighbor.eligible_vehicle_types
+                ]
+                triple_unit_ids = (source_unit_id, left_neighbor_id, right_neighbor_id)
+                triple_singleton_cost = (
+                    singleton_cost_by_unit[source_unit_id]
+                    + singleton_cost_by_unit[left_neighbor_id]
+                    + singleton_cost_by_unit[right_neighbor_id]
+                )
+                avg_overlap = self._average_time_window_overlap_minutes(triple_unit_ids)
+                avg_distance = self._average_customer_distance_km(triple_unit_ids)
+                if common_small_types:
+                    best_candidate = self._best_route_candidate_for_units(common_small_types, triple_unit_ids)
+                    if best_candidate is not None:
+                        vehicle_type, ordered_unit_ids, route_eval = best_candidate
+                        saving = triple_singleton_cost - route_eval.best_cost
+                        residual_flex_small_records.append((saving, avg_overlap, avg_distance, route_eval.best_cost, vehicle_type, ordered_unit_ids))
+                if common_big_types:
+                    best_candidate = self._best_route_candidate_for_units(common_big_types, triple_unit_ids)
+                    if best_candidate is not None:
+                        vehicle_type, ordered_unit_ids, route_eval = best_candidate
+                        saving = triple_singleton_cost - route_eval.best_cost
+                        residual_promotion_records.append((saving, avg_overlap, avg_distance, route_eval.best_cost, vehicle_type, ordered_unit_ids))
+
+            residual_promotion_records.sort(key=lambda item: (-item[0], -item[1], item[2], item[3], item[4], item[5]))
+            residual_flex_small_records.sort(key=lambda item: (-item[0], -item[1], item[2], item[3], item[4], item[5]))
+
+            for saving, _, _, _, vehicle_type, ordered_unit_ids in residual_promotion_records[:RESIDUAL_PROMOTION_PER_SOURCE_LIMIT]:
+                self._register_candidate_route(route_pool, vehicle_type, ordered_unit_ids, "residual_promotion")
+                key = (vehicle_type, ordered_unit_ids)
+                residual_saving_by_key[key] = max(residual_saving_by_key.get(key, -np.inf), float(saving))
+            for saving, _, _, _, vehicle_type, ordered_unit_ids in residual_flex_small_records[:RESIDUAL_FLEX_SMALL_PER_SOURCE_LIMIT]:
+                self._register_candidate_route(route_pool, vehicle_type, ordered_unit_ids, "residual_flex_small")
+                key = (vehicle_type, ordered_unit_ids)
+                residual_saving_by_key[key] = max(residual_saving_by_key.get(key, -np.inf), float(saving))
+
+        return residual_saving_by_key
+
+    def _augment_route_pool_with_pass3_flex_small_candidates(
+        self,
+        route_pool: dict[tuple[str, tuple[int, ...]], CandidateRouteSpec],
+        pass_result: dict[str, object],
+        residual_saving_by_key: dict[tuple[str, tuple[int, ...]], float],
+    ) -> dict[tuple[str, tuple[int, ...]], float]:
+        selected_columns = [
+            pass_result["columns"][idx]
+            for idx in pass_result["selected_indices"]
+        ]
+        singleton_cost_by_unit: dict[int, float] = {}
+        for column in pass_result["columns"]:
+            if int(column["unit_count"]) != 1:
+                continue
+            unit_id = int(column["unit_ids"][0])
+            if self._unit_is_heavy_big_only(unit_id):
+                continue
+            singleton_cost_by_unit[unit_id] = min(
+                singleton_cost_by_unit.get(unit_id, np.inf),
+                float(column["best_cost"]),
+            )
+        residual_unit_ids = list(singleton_cost_by_unit)
+        if not residual_unit_ids:
+            return residual_saving_by_key
+
+        ranked_source_unit_ids = self._rank_residual_source_unit_ids(
+            source_unit_ids=residual_unit_ids,
+            singleton_cost_by_unit=singleton_cost_by_unit,
+            source_limit=PASS3_SOURCE_LIMIT,
+        )
+        small_vehicle_types = ("fuel_1250", "ev_1250", "fuel_1500")
+        selected_small_columns = [
+            column
+            for column in selected_columns
+            if not self._column_has_any_role(column, {"rigid_big"})
+            and self._column_has_any_role(column, {"singleton", "flex_small", "residual_flex_small", "cluster_flex_small"})
+        ]
+        if not selected_small_columns:
+            return residual_saving_by_key
+
+        for source_unit_id in ranked_source_unit_ids:
+            source_unit = self.unit_by_id[source_unit_id]
+            scored_cluster_columns: list[tuple[float, float, float, int, tuple[int, ...]]] = []
+            for column in selected_small_columns:
+                unit_ids = tuple(int(unit_id) for unit_id in column["unit_ids"])
+                if source_unit_id in unit_ids:
+                    continue
+                route_overlap = max(
+                    self._time_window_overlap_minutes(source_unit_id, unit_id)
+                    for unit_id in unit_ids
+                )
+                min_distance = min(
+                    self._distance_between(source_unit.orig_cust_id, self.unit_by_id[unit_id].orig_cust_id)
+                    for unit_id in unit_ids
+                )
+                scored_cluster_columns.append(
+                    (
+                        -route_overlap,
+                        min_distance,
+                        -float(column["candidate_score"]),
+                        -len(unit_ids),
+                        unit_ids,
+                    )
+                )
+            scored_cluster_columns.sort()
+            cluster_unit_ids = {source_unit_id}
+            for _, _, _, _, unit_ids in scored_cluster_columns[:PASS3_CLUSTER_ROUTE_LIMIT]:
+                cluster_unit_ids.update(unit_ids)
+            if len(cluster_unit_ids) <= 1:
+                continue
+            ranked_partner_ids = sorted(
+                [unit_id for unit_id in cluster_unit_ids if unit_id != source_unit_id],
+                key=lambda unit_id: (
+                    -self._time_window_overlap_minutes(source_unit_id, unit_id),
+                    self._distance_between(source_unit.orig_cust_id, self.unit_by_id[unit_id].orig_cust_id),
+                    -singleton_cost_by_unit.get(unit_id, 0.0),
+                    unit_id,
+                ),
+            )[:PASS3_CLUSTER_PARTNER_UNIT_LIMIT]
+            candidate_neighbor_ids = ranked_partner_ids
+            if not candidate_neighbor_ids:
+                continue
+
+            pair_records: list[tuple[float, float, float, float, str, tuple[int, ...]]] = []
+            triple_records: list[tuple[float, float, float, float, str, tuple[int, ...]]] = []
+            quad_records: list[tuple[float, float, float, float, str, tuple[int, ...]]] = []
+            partner_best_saving: dict[int, float] = {}
+
+            for neighbor_unit_id in candidate_neighbor_ids:
+                neighbor_unit = self.unit_by_id[neighbor_unit_id]
+                common_small_types = [
+                    vehicle_type
+                    for vehicle_type in small_vehicle_types
+                    if vehicle_type in source_unit.eligible_vehicle_types and vehicle_type in neighbor_unit.eligible_vehicle_types
+                ]
+                if not common_small_types:
+                    continue
+                best_candidate = self._best_route_candidate_for_units(common_small_types, (source_unit_id, neighbor_unit_id))
+                if best_candidate is None:
+                    continue
+                vehicle_type, ordered_unit_ids, route_eval = best_candidate
+                saving = singleton_cost_by_unit[source_unit_id] + singleton_cost_by_unit[neighbor_unit_id] - route_eval.best_cost
+                avg_overlap = self._average_time_window_overlap_minutes((source_unit_id, neighbor_unit_id))
+                avg_distance = self._average_customer_distance_km((source_unit_id, neighbor_unit_id))
+                pair_records.append((saving, avg_overlap, avg_distance, route_eval.best_cost, vehicle_type, ordered_unit_ids))
+                partner_best_saving[neighbor_unit_id] = max(partner_best_saving.get(neighbor_unit_id, -np.inf), saving)
+
+            top_partner_ids = [
+                neighbor_unit_id
+                for neighbor_unit_id, _ in sorted(
+                    partner_best_saving.items(),
+                    key=lambda item: (
+                        -item[1],
+                        self._distance_between(source_unit.orig_cust_id, self.unit_by_id[item[0]].orig_cust_id),
+                        item[0],
+                    ),
+                )[:PASS3_TRIPLE_PARTNER_LIMIT]
+            ]
+
+            for left_neighbor_id, right_neighbor_id in combinations(top_partner_ids, 2):
+                left_neighbor = self.unit_by_id[left_neighbor_id]
+                right_neighbor = self.unit_by_id[right_neighbor_id]
+                if len({source_unit.orig_cust_id, left_neighbor.orig_cust_id, right_neighbor.orig_cust_id}) < 3:
+                    continue
+                common_small_types = [
+                    vehicle_type
+                    for vehicle_type in small_vehicle_types
+                    if vehicle_type in source_unit.eligible_vehicle_types
+                    and vehicle_type in left_neighbor.eligible_vehicle_types
+                    and vehicle_type in right_neighbor.eligible_vehicle_types
+                ]
+                if not common_small_types:
+                    continue
+                triple_unit_ids = (source_unit_id, left_neighbor_id, right_neighbor_id)
+                best_candidate = self._best_route_candidate_for_units(common_small_types[:2], triple_unit_ids)
+                if best_candidate is None:
+                    continue
+                vehicle_type, ordered_unit_ids, route_eval = best_candidate
+                saving = (
+                    singleton_cost_by_unit[source_unit_id]
+                    + singleton_cost_by_unit[left_neighbor_id]
+                    + singleton_cost_by_unit[right_neighbor_id]
+                    - route_eval.best_cost
+                )
+                avg_overlap = self._average_time_window_overlap_minutes(triple_unit_ids)
+                avg_distance = self._average_customer_distance_km(triple_unit_ids)
+                triple_records.append((saving, avg_overlap, avg_distance, route_eval.best_cost, vehicle_type, ordered_unit_ids))
+
+            for first_neighbor_id, second_neighbor_id, third_neighbor_id in combinations(top_partner_ids, 3):
+                neighbor_ids = (source_unit_id, first_neighbor_id, second_neighbor_id, third_neighbor_id)
+                if len({self.unit_by_id[unit_id].orig_cust_id for unit_id in neighbor_ids}) < 4:
+                    continue
+                common_small_types = [
+                    vehicle_type
+                    for vehicle_type in small_vehicle_types
+                    if all(vehicle_type in self.unit_by_id[unit_id].eligible_vehicle_types for unit_id in neighbor_ids)
+                ]
+                if not common_small_types:
+                    continue
+                best_candidate = self._best_route_candidate_for_units(common_small_types[:2], neighbor_ids)
+                if best_candidate is None:
+                    continue
+                vehicle_type, ordered_unit_ids, route_eval = best_candidate
+                saving = sum(singleton_cost_by_unit[unit_id] for unit_id in neighbor_ids) - route_eval.best_cost
+                avg_overlap = self._average_time_window_overlap_minutes(neighbor_ids)
+                avg_distance = self._average_customer_distance_km(neighbor_ids)
+                quad_records.append((saving, avg_overlap, avg_distance, route_eval.best_cost, vehicle_type, ordered_unit_ids))
+
+            pair_records.sort(key=lambda item: (-item[0], -item[1], item[2], item[3], item[4], item[5]))
+            triple_records.sort(key=lambda item: (-item[0], -item[1], item[2], item[3], item[4], item[5]))
+            quad_records.sort(key=lambda item: (-item[0], -item[1], item[2], item[3], item[4], item[5]))
+
+            for record_set, limit in (
+                (pair_records, PASS3_FLEX_SMALL_PAIR_PER_SOURCE_LIMIT),
+                (triple_records, PASS3_FLEX_SMALL_TRIPLE_PER_SOURCE_LIMIT),
+                (quad_records, PASS3_FLEX_SMALL_QUAD_PER_SOURCE_LIMIT),
+            ):
+                for saving, _, _, _, vehicle_type, ordered_unit_ids in record_set[:limit]:
+                    self._register_candidate_route(route_pool, vehicle_type, ordered_unit_ids, "cluster_flex_small")
+                    key = (vehicle_type, ordered_unit_ids)
+                    residual_saving_by_key[key] = max(residual_saving_by_key.get(key, -np.inf), float(saving))
+
+        return residual_saving_by_key
+
+    def _build_route_pool_columns(
+        self,
+        seed_routes: list[TypedRoute],
+        route_pool: dict[tuple[str, tuple[int, ...]], CandidateRouteSpec] | None = None,
+        max_columns: int = ROUTE_POOL_MAX_COLUMNS,
+        promotion_limit: int = ROUTE_POOL_PROMOTION_LIMIT,
+        flex_small_limit: int = ROUTE_POOL_FLEX_SMALL_LIMIT,
+        residual_promotion_limit: int = ROUTE_POOL_RESIDUAL_PROMOTION_LIMIT,
+        residual_flex_small_limit: int = ROUTE_POOL_RESIDUAL_FLEX_SMALL_LIMIT,
+        residual_saving_by_key: dict[tuple[str, tuple[int, ...]], float] | None = None,
+    ) -> list[dict[str, object]]:
+        raw_pool = route_pool if route_pool is not None else self._generate_route_pool(seed_routes)
+        residual_saving_by_key = residual_saving_by_key or {}
+        current_route_by_unit = {
+            int(unit_id): route
+            for route in seed_routes
+            for unit_id in route.unit_ids
+        }
+        current_route_cost_by_key = {
+            self._route_key(route): float(self.evaluate_route(route).best_cost)
+            for route in seed_routes
+        }
+        singleton_cost_by_unit: dict[int, float] = {}
+        for spec in raw_pool.values():
+            if len(spec.route.unit_ids) != 1:
+                continue
+            unit_id = spec.route.unit_ids[0]
+            singleton_cost_by_unit[unit_id] = min(singleton_cost_by_unit.get(unit_id, np.inf), spec.route_eval.best_cost)
+
+        grouped_columns: dict[tuple[str, frozenset[int]], list[dict[str, object]]] = defaultdict(list)
+        for key, spec in raw_pool.items():
+            roles = set(spec.roles)
+            if "seed" in roles:
+                roles.add("current")
+            (
+                promotion_like_big_route_flag,
+                piggyback_big_route_flag,
+                blocking_big_flexible_route_flag,
+                blocking_big_flexible_unit_count,
+                big_route_flag,
+                big_flexible_unit_count,
+                heavy_big_only_unit_count,
+            ) = self._route_big_structure_metrics(spec.route)
+            big_flexible_route_flag = int(big_flexible_unit_count > 0)
+            singleton_cover_cost = float(
+                sum(singleton_cost_by_unit.get(unit_id, spec.route_eval.best_cost) for unit_id in spec.route.unit_ids)
+            )
+            current_cover_keys = {
+                self._route_key(current_route_by_unit[int(unit_id)])
+                for unit_id in spec.route.unit_ids
+            }
+            current_cover_cost = float(sum(current_route_cost_by_key[route_key] for route_key in current_cover_keys))
+            current_cost_saving = current_cover_cost - float(spec.route_eval.best_cost)
+            avg_time_window_overlap_min = self._average_time_window_overlap_minutes(spec.route.unit_ids)
+            avg_customer_distance_km = self._average_customer_distance_km(spec.route.unit_ids)
+            candidate_family = "support"
+            if piggyback_big_route_flag:
+                candidate_family = "piggyback_big"
+            elif promotion_like_big_route_flag:
+                candidate_family = "promotion_like_big"
+            elif (
+                roles & {"flex_small", "residual_flex_small", "cluster_flex_small"}
+                and 2 <= len(spec.route.unit_ids) <= 4
+            ):
+                candidate_family = "flex_small"
+            elif roles & {"seed", "current"}:
+                candidate_family = "seed_current"
+            grouped_columns[(spec.route.vehicle_type, frozenset(spec.route.unit_ids))].append(
+                {
+                    "key": key,
+                    "vehicle_type": spec.route.vehicle_type,
+                    "unit_ids": spec.route.unit_ids,
+                    "unit_set": frozenset(spec.route.unit_ids),
+                    "unit_count": int(len(spec.route.unit_ids)),
+                    "best_cost": float(spec.route_eval.best_cost),
+                    "single_stop_flag": int(len(spec.route.unit_ids) == 1),
+                    "big_route_flag": big_route_flag,
+                    "big_flexible_route_flag": int(big_flexible_route_flag),
+                    "big_flexible_unit_count": int(big_flexible_unit_count),
+                    "mixed_big_route_flag": int(big_flexible_unit_count > 0),
+                    "piggyback_big_route_flag": int(piggyback_big_route_flag),
+                    "promotion_like_big_route_flag": int(promotion_like_big_route_flag),
+                    "blocking_big_flexible_route_flag": int(blocking_big_flexible_route_flag),
+                    "blocking_big_flexible_unit_count": int(blocking_big_flexible_unit_count),
+                    "bad_big_flexible_route_flag": int(blocking_big_flexible_route_flag),
+                    "bad_big_flexible_unit_count": int(blocking_big_flexible_unit_count),
+                    "heavy_big_only_unit_count": int(heavy_big_only_unit_count),
+                    "roles": tuple(sorted(roles)),
+                    "reference_cost": singleton_cover_cost,
+                    "promotion_saving": singleton_cover_cost - float(spec.route_eval.best_cost),
+                    "current_cover_cost": current_cover_cost,
+                    "current_cover_route_count": int(len(current_cover_keys)),
+                    "current_cost_saving": current_cost_saving,
+                    "saving_vs_pass1_singletons": residual_saving_by_key.get(key),
+                    "avg_time_window_overlap_min": avg_time_window_overlap_min,
+                    "avg_customer_distance_km": avg_customer_distance_km,
+                    "candidate_family": candidate_family,
+                    "pool_pass": self._column_pool_pass(roles),
+                    "route": spec.route,
+                    "route_eval": spec.route_eval,
+                }
+            )
+
+        deduped_columns: list[dict[str, object]] = []
+        for _, candidates in grouped_columns.items():
+            candidates.sort(
+                key=lambda item: (
+                    item["best_cost"],
+                    -len(item["unit_ids"]),
+                    item["unit_ids"],
+                )
+            )
+            best_candidate = dict(candidates[0])
+            merged_roles = sorted({role for candidate in candidates for role in candidate["roles"]})
+            residual_savings = [candidate["saving_vs_pass1_singletons"] for candidate in candidates if candidate["saving_vs_pass1_singletons"] is not None]
+            best_candidate["roles"] = tuple(merged_roles)
+            best_candidate["pool_pass"] = self._column_pool_pass(merged_roles)
+            best_candidate["saving_vs_pass1_singletons"] = max(residual_savings) if residual_savings else None
+            best_candidate["candidate_score"] = self._column_candidate_score(best_candidate)
+            deduped_columns.append(best_candidate)
+
+        support_columns: list[dict[str, object]] = []
+        flex_small_columns: list[dict[str, object]] = []
+        promotion_like_columns: list[dict[str, object]] = []
+        piggyback_big_columns: list[dict[str, object]] = []
+        overflow_columns: list[dict[str, object]] = []
+        for column in deduped_columns:
+            roles = set(column["roles"])
+            if roles & {"seed", "current", "rigid_big", "singleton"}:
+                support_columns.append(column)
+            elif column["candidate_family"] == "piggyback_big" and float(column["current_cost_saving"]) > COST_IMPROVEMENT_EPS:
+                piggyback_big_columns.append(column)
+            elif (
+                column["candidate_family"] == "promotion_like_big"
+                and float(column["current_cost_saving"]) > COST_IMPROVEMENT_EPS
+            ):
+                promotion_like_columns.append(column)
+            elif (
+                column["candidate_family"] == "flex_small"
+                and float(column["current_cost_saving"]) > COST_IMPROVEMENT_EPS
+            ):
+                flex_small_columns.append(column)
+            else:
+                overflow_columns.append(column)
+
+        flex_small_columns.sort(key=self._column_candidate_sort_key)
+        piggyback_big_columns.sort(key=self._column_candidate_sort_key)
+        promotion_like_columns.sort(key=self._column_candidate_sort_key)
+        overflow_columns.sort(key=self._column_candidate_sort_key)
+
+        selected_columns: list[dict[str, object]] = []
+        seen_keys: set[tuple[str, tuple[int, ...]]] = set()
+
+        def add_columns(columns: Iterable[dict[str, object]]) -> None:
+            for column in columns:
+                if column["key"] in seen_keys:
+                    continue
+                selected_columns.append(column)
+                seen_keys.add(column["key"])
+
+        add_columns(support_columns)
+        add_columns(flex_small_columns[:flex_small_limit])
+        add_columns(piggyback_big_columns[:ROUTE_POOL_PIGGYBACK_BIG_LIMIT])
+        add_columns(promotion_like_columns[:promotion_limit])
+
+        if len(selected_columns) < max_columns:
+            remaining_columns = [
+                column
+                for column in (
+                    flex_small_columns[flex_small_limit:]
+                    + piggyback_big_columns[ROUTE_POOL_PIGGYBACK_BIG_LIMIT:]
+                    + promotion_like_columns[promotion_limit:]
+                    + overflow_columns
+                )
+                if column["key"] not in seen_keys
+            ]
+            remaining_columns.sort(key=self._column_candidate_sort_key)
+            add_columns(remaining_columns[: max(0, max_columns - len(selected_columns))])
+
+        selected_columns.sort(key=lambda item: (item["vehicle_type"], item["unit_ids"]))
+        return selected_columns
+
+    def _build_set_partitioning_matrices(
+        self,
+        route_pool_columns: list[dict[str, object]],
+    ) -> dict[str, object]:
+        unit_ids = sorted(self.active_unit_ids)
+        unit_to_idx = {unit_id: idx for idx, unit_id in enumerate(unit_ids)}
+        vehicle_types = [vehicle.vehicle_type for vehicle in self.vehicles]
+        vehicle_to_idx = {vehicle_type: idx for idx, vehicle_type in enumerate(vehicle_types)}
+        row_indices: list[int] = []
+        col_indices: list[int] = []
+        data_values: list[int] = []
+        vehicle_row_indices: list[int] = []
+        vehicle_col_indices: list[int] = []
+        vehicle_values: list[int] = []
+
+        for col_idx, column in enumerate(route_pool_columns):
+            for unit_id in column["unit_ids"]:
+                row_indices.append(unit_to_idx[int(unit_id)])
+                col_indices.append(col_idx)
+                data_values.append(1)
+            vehicle_row_indices.append(vehicle_to_idx[str(column["vehicle_type"])])
+            vehicle_col_indices.append(col_idx)
+            vehicle_values.append(1)
+
+        cover_matrix = csc_matrix(
+            (np.array(data_values, dtype=float), (np.array(row_indices), np.array(col_indices))),
+            shape=(len(unit_ids), len(route_pool_columns)),
+        )
+        vehicle_matrix = csc_matrix(
+            (np.array(vehicle_values, dtype=float), (np.array(vehicle_row_indices), np.array(vehicle_col_indices))),
+            shape=(len(vehicle_types), len(route_pool_columns)),
+        )
+
+        metric_vectors = {
+            "bad_big_flexible_route_count": np.array([float(column["bad_big_flexible_route_flag"]) for column in route_pool_columns], dtype=float),
+            "bad_big_flexible_unit_count": np.array([float(column["bad_big_flexible_unit_count"]) for column in route_pool_columns], dtype=float),
+            "blocking_big_flexible_route_count": np.array([float(column["blocking_big_flexible_route_flag"]) for column in route_pool_columns], dtype=float),
+            "blocking_big_flexible_unit_count": np.array([float(column["blocking_big_flexible_unit_count"]) for column in route_pool_columns], dtype=float),
+            "piggyback_big_route_count": np.array([float(column["piggyback_big_route_flag"]) for column in route_pool_columns], dtype=float),
+            "mixed_big_route_count": np.array([float(column["mixed_big_route_flag"]) for column in route_pool_columns], dtype=float),
+            "promotion_like_big_route_count": np.array([float(column["promotion_like_big_route_flag"]) for column in route_pool_columns], dtype=float),
+            "big_route_count": np.array([float(column["big_route_flag"]) for column in route_pool_columns], dtype=float),
+            "single_stop_count": np.array([float(column["single_stop_flag"]) for column in route_pool_columns], dtype=float),
+            "route_count": np.ones(len(route_pool_columns), dtype=float),
+            "total_cost": np.array([float(column["best_cost"]) for column in route_pool_columns], dtype=float),
+        }
+
+        cover_constraint = LinearConstraint(cover_matrix, np.ones(len(unit_ids)), np.ones(len(unit_ids)))
+        vehicle_upper = np.array([float(self.vehicle_by_name[vehicle_type].vehicle_count) for vehicle_type in vehicle_types], dtype=float)
+        vehicle_constraint = LinearConstraint(vehicle_matrix, -np.inf * np.ones(len(vehicle_types)), vehicle_upper)
+
+        return {
+            "columns": route_pool_columns,
+            "unit_ids": unit_ids,
+            "vehicle_types": vehicle_types,
+            "cover_constraint": cover_constraint,
+            "vehicle_constraint": vehicle_constraint,
+            "metric_vectors": metric_vectors,
+            "bounds": Bounds(np.zeros(len(route_pool_columns)), np.ones(len(route_pool_columns))),
+            "integrality": np.ones(len(route_pool_columns), dtype=int),
+        }
+
+    @staticmethod
+    def _selected_indices_from_vector(x: np.ndarray | None) -> list[int]:
+        if x is None:
+            return []
+        return [idx for idx, value in enumerate(x) if float(value) >= 0.5]
+
+    def _metric_value_from_indices(
+        self,
+        metric_vector: np.ndarray,
+        selected_indices: list[int],
+    ) -> float:
+        if not selected_indices:
+            return 0.0
+        return float(metric_vector[np.array(selected_indices, dtype=int)].sum())
+
+    def _build_metric_constraint(
+        self,
+        metric_vector: np.ndarray,
+        target_value: float,
+    ) -> LinearConstraint:
+        rounded_target = float(round(target_value))
+        return LinearConstraint(
+            csc_matrix(metric_vector.reshape(1, -1)),
+            np.array([rounded_target], dtype=float),
+            np.array([rounded_target], dtype=float),
+        )
+
+    def _build_metric_upper_bound_constraint(
+        self,
+        metric_vector: np.ndarray,
+        upper_bound: float,
+    ) -> LinearConstraint:
+        rounded_upper_bound = float(round(upper_bound))
+        return LinearConstraint(
+            csc_matrix(metric_vector.reshape(1, -1)),
+            np.array([-np.inf], dtype=float),
+            np.array([rounded_upper_bound], dtype=float),
+        )
+
+    def _selected_route_pool_metrics(
+        self,
+        route_pool_columns: list[dict[str, object]],
+        selected_indices: list[int],
+    ) -> dict[str, object]:
+        selected_columns = [route_pool_columns[idx] for idx in selected_indices]
+        return {
+            "selected_singleton_count": sum(int(self._column_has_any_role(column, {"singleton"})) for column in selected_columns),
+            "selected_flexible_singleton_count": sum(
+                int(int(column["unit_count"]) == 1 and not self._column_has_any_role(column, {"rigid_big"}))
+                for column in selected_columns
+            ),
+            "selected_rigid_big_singleton_count": sum(
+                int(int(column["unit_count"]) == 1 and self._column_has_any_role(column, {"rigid_big"}))
+                for column in selected_columns
+            ),
+            "selected_promotion_count": sum(int(self._column_has_any_role(column, {"promotion", "residual_promotion"})) for column in selected_columns),
+            "selected_promotion_like_count": sum(int(column["promotion_like_big_route_flag"]) for column in selected_columns),
+            "selected_piggyback_big_count": sum(int(column["piggyback_big_route_flag"]) for column in selected_columns),
+            "selected_flex_small_count": sum(int(self._column_has_any_role(column, {"flex_small", "residual_flex_small", "cluster_flex_small"})) for column in selected_columns),
+            "selected_flex_small_count_by_size": self._flex_small_count_by_size(selected_columns),
+            "selected_mixed_big_route_count": sum(int(column["mixed_big_route_flag"]) for column in selected_columns),
+            "selected_blocking_big_flexible_route_count": sum(int(column["blocking_big_flexible_route_flag"]) for column in selected_columns),
+            "selected_blocking_big_flexible_unit_count": sum(int(column["blocking_big_flexible_unit_count"]) for column in selected_columns),
+            "selected_bad_big_flexible_route_count": sum(int(column["bad_big_flexible_route_flag"]) for column in selected_columns),
+            "selected_bad_big_flexible_unit_count": sum(int(column["bad_big_flexible_unit_count"]) for column in selected_columns),
+            "big_route_count": sum(int(column["big_route_flag"]) for column in selected_columns),
+        }
+
+    def _milp_phase_status(
+        self,
+        phase_name: str,
+        stage: str,
+        result_status: str,
+        fallback_used: bool,
+        selected_indices: list[int],
+        objective_value: float | None,
+    ) -> dict[str, object]:
+        return {
+            "phase": phase_name,
+            "stage": stage,
+            "status": result_status,
+            "fallback_used": int(fallback_used),
+            "selected_route_count": len(selected_indices),
+            "objective_value": None if objective_value is None else float(objective_value),
+        }
+
+    def _solve_milp_phase(
+        self,
+        model_bundle: dict[str, object],
+        phase_name: str,
+        stage: str,
+        objective_vector: np.ndarray,
+        fixed_constraints: list[LinearConstraint],
+        fallback_objective_vector: np.ndarray | None = None,
+    ) -> tuple[list[int] | None, dict[str, object]]:
+        constraints = [
+            model_bundle["cover_constraint"],
+            model_bundle["vehicle_constraint"],
+            *fixed_constraints,
+        ]
+        options = {
+            "time_limit": MILP_PHASE_TIME_LIMIT_SEC,
+            "disp": False,
+            "mip_rel_gap": MILP_REL_GAP,
+        }
+        result = milp(
+            c=objective_vector,
+            integrality=model_bundle["integrality"],
+            bounds=model_bundle["bounds"],
+            constraints=constraints,
+            options=options,
+        )
+        if bool(result.success) and result.x is not None:
+            selected_indices = self._selected_indices_from_vector(result.x)
+            return selected_indices, self._milp_phase_status(
+                phase_name=phase_name,
+                stage=stage,
+                result_status="optimal",
+                fallback_used=False,
+                selected_indices=selected_indices,
+                objective_value=float(result.fun),
+            )
+
+        if fallback_objective_vector is not None:
+            fallback_objective = fallback_objective_vector
+        elif stage == "unlock":
+            fallback_objective = (
+                1e6 * model_bundle["metric_vectors"]["bad_big_flexible_route_count"]
+                + 1e4 * model_bundle["metric_vectors"]["bad_big_flexible_unit_count"]
+                + 1e2 * model_bundle["metric_vectors"]["big_route_count"]
+                + model_bundle["metric_vectors"]["total_cost"]
+            )
+        else:
+            fallback_objective = (
+                1e6 * model_bundle["metric_vectors"]["single_stop_count"]
+                + 1e4 * model_bundle["metric_vectors"]["route_count"]
+                + 1e1 * model_bundle["metric_vectors"]["big_route_count"]
+                + model_bundle["metric_vectors"]["total_cost"]
+            )
+        fallback_result = milp(
+            c=fallback_objective,
+            integrality=model_bundle["integrality"],
+            bounds=model_bundle["bounds"],
+            constraints=constraints,
+            options=options,
+        )
+        if fallback_result.x is None:
+            return None, self._milp_phase_status(
+                phase_name=phase_name,
+                stage=stage,
+                result_status="failed",
+                fallback_used=True,
+                selected_indices=[],
+                objective_value=None,
+            )
+        selected_indices = self._selected_indices_from_vector(fallback_result.x)
+        status = "fallback_success" if bool(fallback_result.success) else f"fallback_status_{getattr(fallback_result, 'status', 'unknown')}"
+        return selected_indices, self._milp_phase_status(
+            phase_name=phase_name,
+            stage=stage,
+            result_status=status,
+            fallback_used=True,
+            selected_indices=selected_indices,
+            objective_value=float(getattr(fallback_result, "fun", np.nan)),
+        )
+
+    def _global_solution_selection_key(
+        self,
+        routes: list[TypedRoute],
+        solution_eval: SolutionEvaluation,
+    ) -> tuple[float, int, int, int, float, float]:
+        return (
+            round(solution_eval.total_cost, 6),
+            abs(solution_eval.split_customer_count - solution_eval.mandatory_split_customer_count),
+            solution_eval.route_count,
+            solution_eval.single_stop_route_count,
+            round(solution_eval.total_late_min, 6),
+            round(solution_eval.total_carbon_kg, 6),
+        )
+
+    def _solve_global_milp_pass(
+        self,
+        route_pool_columns: list[dict[str, object]],
+        pass_label: str,
+    ) -> dict[str, object]:
+        model_bundle = self._build_set_partitioning_matrices(route_pool_columns)
+        selected_indices, phase_status = self._solve_milp_phase(
+            model_bundle=model_bundle,
+            phase_name="cost_first_total_cost",
+            stage="cost_first",
+            objective_vector=model_bundle["metric_vectors"]["total_cost"],
+            fixed_constraints=[],
+            fallback_objective_vector=(
+                model_bundle["metric_vectors"]["total_cost"]
+                + 1e-3 * model_bundle["metric_vectors"]["route_count"]
+                + 1e-4 * model_bundle["metric_vectors"]["single_stop_count"]
+            ),
+        )
+        phase_status["pass_label"] = pass_label
+        phase_status["big_route_bound_mode"] = None
+        if selected_indices is None:
+            return {
+                "status": "failed",
+                "phase_statuses": [phase_status],
+                "columns": route_pool_columns,
+                "selected_routes": None,
+                "selected_indices": [],
+                "phase_metric_targets": {},
+                "big_route_bound_mode": None,
+            }
+
+        selected_role_metrics = self._selected_route_pool_metrics(route_pool_columns, selected_indices)
+        phase_metric_targets = {
+            "total_cost": self._metric_value_from_indices(model_bundle["metric_vectors"]["total_cost"], selected_indices),
+            "route_count": self._metric_value_from_indices(model_bundle["metric_vectors"]["route_count"], selected_indices),
+            "single_stop_count": self._metric_value_from_indices(model_bundle["metric_vectors"]["single_stop_count"], selected_indices),
+            "big_route_count": self._metric_value_from_indices(model_bundle["metric_vectors"]["big_route_count"], selected_indices),
+            "mixed_big_route_count": self._metric_value_from_indices(model_bundle["metric_vectors"]["mixed_big_route_count"], selected_indices),
+            "piggyback_big_route_count": self._metric_value_from_indices(model_bundle["metric_vectors"]["piggyback_big_route_count"], selected_indices),
+            "promotion_like_big_route_count": self._metric_value_from_indices(
+                model_bundle["metric_vectors"]["promotion_like_big_route_count"],
+                selected_indices,
+            ),
+            "blocking_big_flexible_route_count": self._metric_value_from_indices(
+                model_bundle["metric_vectors"]["blocking_big_flexible_route_count"],
+                selected_indices,
+            ),
+            "blocking_big_flexible_unit_count": self._metric_value_from_indices(
+                model_bundle["metric_vectors"]["blocking_big_flexible_unit_count"],
+                selected_indices,
+            ),
+            "selected_piggyback_big_count": float(selected_role_metrics["selected_piggyback_big_count"]),
+            "selected_flex_small_count": float(selected_role_metrics["selected_flex_small_count"]),
+        }
+        return {
+            "status": "ok",
+            "phase_statuses": [phase_status],
+            "columns": route_pool_columns,
+            "selected_routes": [route_pool_columns[idx]["route"] for idx in selected_indices],
+            "selected_indices": selected_indices,
+            "phase_metric_targets": phase_metric_targets,
+            "big_route_bound_mode": None,
+        }
+
+    def _global_reoptimize_with_milp(
+        self,
+        baseline_routes: list[TypedRoute],
+        baseline_solution_eval: SolutionEvaluation,
+    ) -> dict[str, object]:
+        pass1_columns = self._build_route_pool_columns(baseline_routes)
+        pass1_result = self._solve_global_milp_pass(
+            route_pool_columns=pass1_columns,
+            pass_label="pass1",
+        )
+
+        pass2_result: dict[str, object] | None = None
+        pass3_result: dict[str, object] | None = None
+        pass1_routes: list[TypedRoute] | None = None
+        if pass1_result["selected_routes"] is not None:
+            pass1_routes = [self._two_opt_route(route) for route in pass1_result["selected_routes"]]
+            pass1_eval = self.evaluate_solution(pass1_routes)
+            if pass1_eval is not None:
+                pass2_route_pool = self._generate_route_pool(pass1_routes)
+                residual_saving_by_key = self._augment_route_pool_with_residual_candidates(pass2_route_pool, pass1_routes)
+                residual_saving_by_key = self._augment_route_pool_with_pass3_flex_small_candidates(
+                    pass2_route_pool,
+                    pass1_result,
+                    residual_saving_by_key,
+                )
+                pass2_columns = self._build_route_pool_columns(
+                    pass1_routes,
+                    route_pool=pass2_route_pool,
+                    max_columns=ROUTE_POOL_PASS2_MAX_COLUMNS,
+                    residual_saving_by_key=residual_saving_by_key,
+                )
+                pass2_result = self._solve_global_milp_pass(
+                    route_pool_columns=pass2_columns,
+                    pass_label="pass2",
+                )
+
+        final_columns = (
+            pass2_result["columns"]
+            if pass2_result is not None
+            else pass1_result["columns"]
+        )
+        return {
+            "status": "ok" if pass1_result["status"] == "ok" else "failed",
+            "pass1": pass1_result,
+            "pass2": pass2_result,
+            "pass3": pass3_result,
+            "columns": final_columns,
+        }
+
+    def _evaluate_global_pass_result(
+        self,
+        pass_result: dict[str, object] | None,
+    ) -> dict[str, object]:
+        summary = {
+            "routes": None,
+            "solution_eval": None,
+            "route_counts": None,
+            "routes_with_flexible_units_on_big": None,
+            "flexible_units_on_big_routes": None,
+            "mixed_big_route_count": None,
+            "mixed_big_flexible_unit_count": None,
+            "piggyback_big_count": None,
+            "promotion_like_big_count": None,
+            "blocking_big_flexible_route_count": None,
+            "blocking_big_flexible_unit_count": None,
+            "bad_big_flexible_route_count": None,
+            "bad_big_flexible_unit_count": None,
+            "current_single_pairs_feasible": None,
+            "current_single_pairs_inventory_feasible": None,
+            "selected_singleton_count": None,
+            "selected_flexible_singleton_count": None,
+            "selected_rigid_big_singleton_count": None,
+            "selected_promotion_count": None,
+            "selected_promotion_like_count": None,
+            "selected_piggyback_big_count": None,
+            "selected_flex_small_count": None,
+            "selected_flex_small_count_by_size": {},
+            "selected_mixed_big_route_count": None,
+            "selected_blocking_big_flexible_route_count": None,
+            "selected_blocking_big_flexible_unit_count": None,
+            "selected_bad_big_flexible_route_count": None,
+            "selected_bad_big_flexible_unit_count": None,
+            "big_route_count": None,
+            "selected_route_keys": set(),
+            "big_route_bound_mode": None,
+        }
+        if pass_result is None or pass_result["selected_routes"] is None:
+            return summary
+        candidate_routes = [self._two_opt_route(route) for route in pass_result["selected_routes"]]
+        candidate_eval = self.evaluate_solution(candidate_routes)
+        if candidate_eval is None:
+            return summary
+        route_counts = self._route_counts(candidate_routes)
+        big_route_diagnostics = self._solution_big_route_diagnostics(candidate_routes)
+        current_single_pairs_feasible, current_single_pairs_inventory_feasible = self._current_single_pair_inventory_counts(candidate_routes)
+        selected_role_metrics = self._selected_route_pool_metrics(pass_result["columns"], pass_result["selected_indices"])
+        return {
+            "routes": candidate_routes,
+            "solution_eval": candidate_eval,
+            "route_counts": route_counts,
+            "routes_with_flexible_units_on_big": big_route_diagnostics["mixed_big_route_count"],
+            "flexible_units_on_big_routes": big_route_diagnostics["mixed_big_flexible_unit_count"],
+            "mixed_big_route_count": big_route_diagnostics["mixed_big_route_count"],
+            "mixed_big_flexible_unit_count": big_route_diagnostics["mixed_big_flexible_unit_count"],
+            "piggyback_big_count": big_route_diagnostics["piggyback_big_count"],
+            "promotion_like_big_count": big_route_diagnostics["promotion_like_big_count"],
+            "blocking_big_flexible_route_count": big_route_diagnostics["blocking_big_flexible_count"],
+            "blocking_big_flexible_unit_count": big_route_diagnostics["blocking_big_flexible_unit_count"],
+            "bad_big_flexible_route_count": big_route_diagnostics["blocking_big_flexible_count"],
+            "bad_big_flexible_unit_count": big_route_diagnostics["blocking_big_flexible_unit_count"],
+            "current_single_pairs_feasible": current_single_pairs_feasible,
+            "current_single_pairs_inventory_feasible": current_single_pairs_inventory_feasible,
+            "selected_singleton_count": selected_role_metrics["selected_singleton_count"],
+            "selected_flexible_singleton_count": selected_role_metrics["selected_flexible_singleton_count"],
+            "selected_rigid_big_singleton_count": selected_role_metrics["selected_rigid_big_singleton_count"],
+            "selected_promotion_count": selected_role_metrics["selected_promotion_count"],
+            "selected_promotion_like_count": selected_role_metrics["selected_promotion_like_count"],
+            "selected_piggyback_big_count": selected_role_metrics["selected_piggyback_big_count"],
+            "selected_flex_small_count": selected_role_metrics["selected_flex_small_count"],
+            "selected_flex_small_count_by_size": selected_role_metrics["selected_flex_small_count_by_size"],
+            "selected_mixed_big_route_count": selected_role_metrics["selected_mixed_big_route_count"],
+            "selected_blocking_big_flexible_route_count": selected_role_metrics["selected_blocking_big_flexible_route_count"],
+            "selected_blocking_big_flexible_unit_count": selected_role_metrics["selected_blocking_big_flexible_unit_count"],
+            "selected_bad_big_flexible_route_count": selected_role_metrics["selected_bad_big_flexible_route_count"],
+            "selected_bad_big_flexible_unit_count": selected_role_metrics["selected_bad_big_flexible_unit_count"],
+            "big_route_count": selected_role_metrics["big_route_count"],
+            "selected_route_keys": {
+                (pass_result["columns"][idx]["vehicle_type"], pass_result["columns"][idx]["unit_ids"])
+                for idx in pass_result["selected_indices"]
+            },
+            "big_route_bound_mode": pass_result["big_route_bound_mode"],
+        }
 
     def _search_cluster_cover(
         self,
@@ -2466,7 +3739,7 @@ class Question1Solver:
         evaluated = self.evaluate_solution(improved)
         return improved, evaluated, operator_name
 
-    def solve(self) -> tuple[SolutionEvaluation, dict[str, object]]:
+    def _solve_single_configuration(self) -> tuple[SolutionEvaluation, list[TypedRoute], dict[str, object]]:
         self.output_root.mkdir(parents=True, exist_ok=True)
         best_solution_eval: SolutionEvaluation | None = None
         best_solution_routes: list[TypedRoute] | None = None
@@ -2541,27 +3814,169 @@ class Question1Solver:
 
         baseline_solution_eval = best_solution_eval
         baseline_solution_routes = list(best_solution_routes)
-        route_pool_routes, route_pool_stats = self._route_pool_optimize_solution(best_solution_routes)
-        route_pool_eval = self.evaluate_solution(route_pool_routes)
-        if route_pool_eval is None:
-            raise RuntimeError("Route-pool optimized solution became infeasible")
-        if (
-            route_pool_eval.route_count <= baseline_solution_eval.route_count
-            and route_pool_eval.single_stop_route_count <= baseline_solution_eval.single_stop_route_count
-            and self._route_pool_solution_key(route_pool_routes, route_pool_eval)
-            < self._route_pool_solution_key(best_solution_routes, best_solution_eval)
-        ):
-            best_solution_routes = route_pool_routes
-            best_solution_eval = route_pool_eval
+        baseline_route_counts = self._route_counts(baseline_solution_routes)
+        baseline_big_route_diagnostics = self._solution_big_route_diagnostics(baseline_solution_routes)
+        baseline_bad_big_flexible_route_count = baseline_big_route_diagnostics["blocking_big_flexible_count"]
+        baseline_bad_big_flexible_unit_count = baseline_big_route_diagnostics["blocking_big_flexible_unit_count"]
+        baseline_current_single_pairs_feasible, baseline_current_single_pairs_inventory_feasible = self._current_single_pair_inventory_counts(
+            baseline_solution_routes
+        )
+
+        global_result = self._global_reoptimize_with_milp(baseline_solution_routes, baseline_solution_eval)
+        pass1_result = global_result["pass1"]
+        pass2_result = global_result["pass2"]
+        pass3_result = global_result["pass3"]
+        pass1_summary = self._evaluate_global_pass_result(pass1_result)
+        pass2_summary = self._evaluate_global_pass_result(pass2_result)
+        pass3_summary = self._evaluate_global_pass_result(pass3_result)
+
+        available_global_summaries = [
+            ("pass1", pass1_summary),
+            ("pass2", pass2_summary),
+            ("pass3", pass3_summary),
+        ]
+        feasible_global_summaries = [
+            (label, summary)
+            for label, summary in available_global_summaries
+            if summary["solution_eval"] is not None
+        ]
+        if feasible_global_summaries:
+            active_global_label, active_global_summary = min(
+                feasible_global_summaries,
+                key=lambda item: self._global_solution_selection_key(
+                    item[1]["routes"],
+                    item[1]["solution_eval"],
+                ),
+            )
+        else:
+            active_global_summary = pass1_summary
+            active_global_label = "pass1"
+
+        best_solution_routes = baseline_solution_routes
+        best_solution_eval = baseline_solution_eval
+        final_solution_source = "baseline"
+        global_validation_status = "cost_first_model_failed"
+        cost_first_improved = False
+        if active_global_summary["solution_eval"] is not None:
+            candidate_eval = active_global_summary["solution_eval"]
+            split_guard_ok = (
+                candidate_eval.split_customer_count == candidate_eval.mandatory_split_customer_count
+            )
+            cost_improved = (
+                split_guard_ok
+                and candidate_eval.total_cost + COST_IMPROVEMENT_EPS < baseline_solution_eval.total_cost
+            )
+            if not split_guard_ok:
+                global_validation_status = "cost_first_split_guard_failed"
+            elif cost_improved:
+                global_validation_status = "cost_first_improved"
+            else:
+                global_validation_status = "cost_first_no_improvement"
+            if cost_improved and (
+                self._global_solution_selection_key(
+                    active_global_summary["routes"],
+                    candidate_eval,
+                )
+                < self._global_solution_selection_key(
+                    baseline_solution_routes,
+                    baseline_solution_eval,
+                )
+            ):
+                best_solution_routes = active_global_summary["routes"]
+                best_solution_eval = candidate_eval
+                final_solution_source = active_global_label
+                cost_first_improved = True
 
         elapsed_sec = time.perf_counter() - search_start
         final_route_counts = self._route_counts(best_solution_routes)
-        final_routes_with_flexible_units_on_big, final_flexible_units_on_big_routes = self._final_solution_structure_metrics(best_solution_routes)
+        final_big_route_diagnostics = self._solution_big_route_diagnostics(best_solution_routes)
+        final_bad_big_flexible_route_count = final_big_route_diagnostics["blocking_big_flexible_count"]
+        final_bad_big_flexible_unit_count = final_big_route_diagnostics["blocking_big_flexible_unit_count"]
         final_current_single_pairs_feasible, final_current_single_pairs_inventory_feasible = self._current_single_pair_inventory_counts(best_solution_routes)
+        selected_route_pool_role_counts = Counter[str]()
+        for column in global_result["columns"]:
+            for role in column["roles"]:
+                selected_route_pool_role_counts[role] += 1
+        promotion_like_candidate_count = sum(int(column["promotion_like_big_route_flag"]) for column in global_result["columns"])
+        positive_saving_promotion_like_candidate_count = sum(
+            int(
+                column["promotion_like_big_route_flag"]
+                and float(column["current_cost_saving"]) > COST_IMPROVEMENT_EPS
+            )
+            for column in global_result["columns"]
+        )
+        piggyback_big_candidate_count = sum(int(column["piggyback_big_route_flag"]) for column in global_result["columns"])
+        positive_saving_piggyback_big_candidate_count = sum(
+            int(
+                column["piggyback_big_route_flag"]
+                and float(column["current_cost_saving"]) > COST_IMPROVEMENT_EPS
+            )
+            for column in global_result["columns"]
+        )
+        baseline_route_key_set = {self._route_key(route) for route in baseline_solution_routes}
+        pass1_selected_route_keys = pass1_summary["selected_route_keys"]
+        pass2_selected_route_keys = pass2_summary["selected_route_keys"]
+        pass3_selected_route_keys = pass3_summary["selected_route_keys"]
+        active_global_selected_route_keys = active_global_summary["selected_route_keys"]
+        flex_small_candidate_count_by_size = self._flex_small_count_by_size(global_result["columns"])
+        selected_flex_small_count_by_size = active_global_summary["selected_flex_small_count_by_size"] or {}
+        active_column_limit = (
+            ROUTE_POOL_PASS2_MAX_COLUMNS
+            if pass3_result is not None or pass2_result is not None
+            else ROUTE_POOL_MAX_COLUMNS
+        )
+        candidate_pool_cap_binding_flag = int(len(global_result["columns"]) >= 0.95 * active_column_limit)
+        route_pool_summary_rows = [
+            {
+                "route_key": f"{column['vehicle_type']}|{','.join(str(unit_id) for unit_id in column['unit_ids'])}",
+                "vehicle_type": column["vehicle_type"],
+                "unit_ids": ",".join(str(unit_id) for unit_id in column["unit_ids"]),
+                "unit_count": int(column["unit_count"]),
+                "best_cost": round(float(column["best_cost"]), 6),
+                "current_cover_cost": round(float(column["current_cover_cost"]), 6),
+                "current_cover_route_count": int(column["current_cover_route_count"]),
+                "current_cost_saving": round(float(column["current_cost_saving"]), 6),
+                "single_stop_flag": int(column["single_stop_flag"]),
+                "big_route_flag": int(column["big_route_flag"]),
+                "big_flexible_route_flag": int(column["big_flexible_route_flag"]),
+                "big_flexible_unit_count": int(column["big_flexible_unit_count"]),
+                "mixed_big_route_flag": int(column["mixed_big_route_flag"]),
+                "piggyback_big_route_flag": int(column["piggyback_big_route_flag"]),
+                "promotion_like_big_route_flag": int(column["promotion_like_big_route_flag"]),
+                "blocking_big_flexible_route_flag": int(column["blocking_big_flexible_route_flag"]),
+                "blocking_big_flexible_unit_count": int(column["blocking_big_flexible_unit_count"]),
+                "bad_big_flexible_route_flag": int(column["bad_big_flexible_route_flag"]),
+                "bad_big_flexible_unit_count": int(column["bad_big_flexible_unit_count"]),
+                "avg_time_window_overlap_min": round(float(column["avg_time_window_overlap_min"]), 6),
+                "candidate_score": round(float(column["candidate_score"]), 6),
+                "candidate_family": column["candidate_family"],
+                "pool_pass": column["pool_pass"],
+                "roles": ",".join(column["roles"]),
+                "saving_vs_pass1_singletons": None
+                if column["saving_vs_pass1_singletons"] is None
+                else round(float(column["saving_vs_pass1_singletons"]), 6),
+                "selected_in_baseline": int((column["vehicle_type"], column["unit_ids"]) in baseline_route_key_set),
+                "selected_in_global_pass1": int((column["vehicle_type"], column["unit_ids"]) in pass1_selected_route_keys),
+                "selected_in_global_pass2": int((column["vehicle_type"], column["unit_ids"]) in pass2_selected_route_keys),
+                "selected_in_global_pass3": int((column["vehicle_type"], column["unit_ids"]) in pass3_selected_route_keys),
+                "selected_in_global": int((column["vehicle_type"], column["unit_ids"]) in active_global_selected_route_keys),
+            }
+            for column in global_result["columns"]
+        ]
+        global_phase_statuses = [
+            *(pass1_result["phase_statuses"] if pass1_result is not None else []),
+            *(pass2_result["phase_statuses"] if pass2_result is not None else []),
+            *(pass3_result["phase_statuses"] if pass3_result is not None else []),
+        ]
+        active_global_eval = active_global_summary["solution_eval"]
+        active_global_route_counts = active_global_summary["route_counts"]
         metadata = {
             "best_seed": best_seed,
             "elapsed_sec": elapsed_sec,
             "run_records": run_records,
+            "packing_strategy": self.packing_strategy,
+            "route_pool_iteration_count": COST_FIRST_ROUTE_POOL_ITERATIONS,
+            "cost_first_improved": int(cost_first_improved),
             "service_unit_count": len(self.service_units),
             "route_cache_size": len(self.route_cache._cache),
             "mandatory_split_customer_count": self.service_unit_summary["mandatory_split_customer_count"],
@@ -2582,18 +3997,150 @@ class Question1Solver:
             "batch_merge_success_count": 0,
             "pre_merge_single_stop_route_count": baseline_solution_eval.single_stop_route_count,
             "post_merge_single_stop_route_count": best_solution_eval.single_stop_route_count,
-            "merge_diagnostics_rows": route_pool_stats["route_pool_diagnostics_rows"],
-            "final_routes_with_flexible_units_on_big": final_routes_with_flexible_units_on_big,
-            "final_flexible_units_on_big_routes": final_flexible_units_on_big_routes,
+            "merge_diagnostics_rows": global_phase_statuses,
+            "final_routes_with_flexible_units_on_big": final_big_route_diagnostics["mixed_big_route_count"],
+            "final_flexible_units_on_big_routes": final_big_route_diagnostics["mixed_big_flexible_unit_count"],
+            "final_piggyback_big_count": final_big_route_diagnostics["piggyback_big_count"],
+            "final_promotion_like_big_count": final_big_route_diagnostics["promotion_like_big_count"],
+            "final_blocking_big_flexible_count": final_big_route_diagnostics["blocking_big_flexible_count"],
+            "final_blocking_big_flexible_unit_count": final_big_route_diagnostics["blocking_big_flexible_unit_count"],
             "final_current_single_pairs_inventory_feasible": final_current_single_pairs_inventory_feasible,
-            "diagnostic_unlock_success_count": route_pool_stats["route_pool_release_success_count"],
-            "diagnostic_promotion_success_count": route_pool_stats["route_pool_promotion_success_count"],
-            "route_pool_candidate_count": route_pool_stats["route_pool_candidate_count"],
-            "route_pool_role_counts": route_pool_stats["route_pool_role_counts"],
+            "diagnostic_unlock_success_count": 0,
+            "diagnostic_promotion_success_count": 0,
+            "route_pool_candidate_count": len(global_result["columns"]),
+            "route_pool_role_counts": dict(selected_route_pool_role_counts),
+            "promotion_like_candidate_count": promotion_like_candidate_count,
+            "positive_saving_promotion_like_candidate_count": positive_saving_promotion_like_candidate_count,
+            "piggyback_big_candidate_count": piggyback_big_candidate_count,
+            "positive_saving_piggyback_big_candidate_count": positive_saving_piggyback_big_candidate_count,
+            "candidate_pool_cap_binding_flag": candidate_pool_cap_binding_flag,
+            "flex_small_candidate_count_by_size": flex_small_candidate_count_by_size,
+            "selected_flex_small_count_by_size": selected_flex_small_count_by_size,
             "baseline_route_count": baseline_solution_eval.route_count,
             "baseline_single_stop_route_count": baseline_solution_eval.single_stop_route_count,
+            "baseline_total_cost": baseline_solution_eval.total_cost,
+            "baseline_fuel_3000_used_count": baseline_route_counts.get("fuel_3000", 0),
+            "baseline_fuel_3000_free_count": self._fuel_3000_free_count(baseline_route_counts),
+            "baseline_routes_with_flexible_units_on_big": baseline_big_route_diagnostics["mixed_big_route_count"],
+            "baseline_flexible_units_on_big_routes": baseline_big_route_diagnostics["mixed_big_flexible_unit_count"],
+            "baseline_piggyback_big_count": baseline_big_route_diagnostics["piggyback_big_count"],
+            "baseline_promotion_like_big_count": baseline_big_route_diagnostics["promotion_like_big_count"],
+            "baseline_blocking_big_flexible_count": baseline_big_route_diagnostics["blocking_big_flexible_count"],
+            "baseline_blocking_big_flexible_unit_count": baseline_big_route_diagnostics["blocking_big_flexible_unit_count"],
+            "baseline_bad_big_flexible_route_count": baseline_bad_big_flexible_route_count,
+            "baseline_bad_big_flexible_unit_count": baseline_bad_big_flexible_unit_count,
+            "baseline_current_single_pairs_feasible": baseline_current_single_pairs_feasible,
+            "baseline_current_single_pairs_inventory_feasible": baseline_current_single_pairs_inventory_feasible,
+            "global_model_status": global_result["status"],
+            "global_phase_statuses": global_phase_statuses,
+            "global_selected_as_final": int(cost_first_improved),
+            "global_validation_status": global_validation_status,
+            "global_route_pool_candidate_count": len(global_result["columns"]),
+            "global_unlock_big_mixed_route_count": None,
+            "global_unlock_big_mixed_unit_count": None,
+            "global_unlock_bad_big_flexible_route_count": None,
+            "global_unlock_bad_big_flexible_unit_count": None,
+            "global_unlock_big_route_count": None,
+            "global_final_total_cost": None if active_global_eval is None else active_global_eval.total_cost,
+            "global_final_route_count": None if active_global_eval is None else active_global_eval.route_count,
+            "global_final_single_stop_route_count": None if active_global_eval is None else active_global_eval.single_stop_route_count,
+            "global_final_current_single_pairs_feasible": active_global_summary["current_single_pairs_feasible"],
+            "global_final_current_single_pairs_inventory_feasible": active_global_summary["current_single_pairs_inventory_feasible"],
+            "global_final_routes_with_flexible_units_on_big": active_global_summary["routes_with_flexible_units_on_big"],
+            "global_final_flexible_units_on_big_routes": active_global_summary["flexible_units_on_big_routes"],
+            "global_final_piggyback_big_count": active_global_summary["piggyback_big_count"],
+            "global_final_promotion_like_big_count": active_global_summary["promotion_like_big_count"],
+            "global_final_blocking_big_flexible_count": active_global_summary["blocking_big_flexible_route_count"],
+            "global_final_blocking_big_flexible_unit_count": active_global_summary["blocking_big_flexible_unit_count"],
+            "global_fuel_3000_used_count": None if active_global_route_counts is None else active_global_route_counts.get("fuel_3000", 0),
+            "global_fuel_3000_free_count": None if active_global_route_counts is None else self._fuel_3000_free_count(active_global_route_counts),
+            "global_big_route_bound_mode": active_global_summary["big_route_bound_mode"],
+            "global_pass1_route_count": None if pass1_summary["solution_eval"] is None else pass1_summary["solution_eval"].route_count,
+            "global_pass1_single_stop_route_count": None if pass1_summary["solution_eval"] is None else pass1_summary["solution_eval"].single_stop_route_count,
+            "global_pass1_selected_singleton_count": pass1_summary["selected_singleton_count"],
+            "global_pass1_selected_promotion_count": pass1_summary["selected_promotion_count"],
+            "global_pass1_selected_promotion_like_count": pass1_summary["selected_promotion_like_count"],
+            "global_pass1_selected_piggyback_big_count": pass1_summary["selected_piggyback_big_count"],
+            "global_pass1_big_route_count": pass1_summary["big_route_count"],
+            "global_pass1_mixed_big_route_count": pass1_summary["mixed_big_route_count"],
+            "global_pass1_blocking_big_flexible_route_count": pass1_summary["blocking_big_flexible_route_count"],
+            "global_pass1_blocking_big_flexible_unit_count": pass1_summary["blocking_big_flexible_unit_count"],
+            "global_pass1_bad_big_flexible_route_count": pass1_summary["bad_big_flexible_route_count"],
+            "global_pass1_bad_big_flexible_unit_count": pass1_summary["bad_big_flexible_unit_count"],
+            "global_pass2_route_count": None if pass2_summary["solution_eval"] is None else pass2_summary["solution_eval"].route_count,
+            "global_pass2_single_stop_route_count": None if pass2_summary["solution_eval"] is None else pass2_summary["solution_eval"].single_stop_route_count,
+            "global_pass2_selected_singleton_count": pass2_summary["selected_singleton_count"],
+            "global_pass2_selected_promotion_count": pass2_summary["selected_promotion_count"],
+            "global_pass2_selected_promotion_like_count": pass2_summary["selected_promotion_like_count"],
+            "global_pass2_selected_piggyback_big_count": pass2_summary["selected_piggyback_big_count"],
+            "global_pass2_routes_with_flexible_units_on_big": pass2_summary["routes_with_flexible_units_on_big"],
+            "global_pass2_flexible_units_on_big_routes": pass2_summary["flexible_units_on_big_routes"],
+            "global_pass2_big_route_count": pass2_summary["big_route_count"],
+            "global_pass2_mixed_big_route_count": pass2_summary["mixed_big_route_count"],
+            "global_pass2_blocking_big_flexible_route_count": pass2_summary["blocking_big_flexible_route_count"],
+            "global_pass2_blocking_big_flexible_unit_count": pass2_summary["blocking_big_flexible_unit_count"],
+            "global_pass2_bad_big_flexible_route_count": pass2_summary["bad_big_flexible_route_count"],
+            "global_pass2_bad_big_flexible_unit_count": pass2_summary["bad_big_flexible_unit_count"],
+            "global_pass3_route_count": None if pass3_summary["solution_eval"] is None else pass3_summary["solution_eval"].route_count,
+            "global_pass3_single_stop_route_count": None if pass3_summary["solution_eval"] is None else pass3_summary["solution_eval"].single_stop_route_count,
+            "global_pass3_selected_singleton_count": pass3_summary["selected_singleton_count"],
+            "global_pass3_selected_flexible_singleton_count": pass3_summary["selected_flexible_singleton_count"],
+            "global_pass3_selected_rigid_big_singleton_count": pass3_summary["selected_rigid_big_singleton_count"],
+            "global_pass3_selected_flex_small_count": pass3_summary["selected_flex_small_count"],
+            "global_pass3_selected_promotion_like_count": pass3_summary["selected_promotion_like_count"],
+            "global_pass3_selected_piggyback_big_count": pass3_summary["selected_piggyback_big_count"],
+            "global_pass3_bad_big_flexible_route_count": pass3_summary["bad_big_flexible_route_count"],
+            "global_pass3_big_route_count": pass3_summary["big_route_count"],
+            "split_packing_sensitivity_executed": 0,
+            "split_packing_sensitivity_status": "not_run",
+            "split_packing_sensitivity_total_cost": None,
+            "split_packing_sensitivity_route_count": None,
+            "split_packing_sensitivity_reference_total_cost": None,
+            "split_packing_sensitivity_reference_route_count": None,
+            "route_pool_summary_rows": route_pool_summary_rows,
+            "final_solution_source": final_solution_source,
             **best_operator_stats,
         }
+        return best_solution_eval, best_solution_routes, metadata
+
+    def solve(self) -> tuple[SolutionEvaluation, dict[str, object]]:
+        best_solution_eval, best_solution_routes, metadata = self._solve_single_configuration()
+        if (
+            self.enable_split_packing_sensitivity
+            and metadata["global_selected_as_final"] == 0
+        ):
+            sensitivity_solver = Question1Solver(
+                workspace=self.workspace,
+                input_root=self.input_root,
+                output_root=self.output_root,
+                seed_list=self.seed_list,
+                max_generations=self.max_generations,
+                particle_count=self.particle_count,
+                top_route_candidates=self.top_route_candidates,
+                packing_strategy="reduced_big_dependency",
+                enable_split_packing_sensitivity=False,
+            )
+            sensitivity_eval, sensitivity_routes, sensitivity_metadata = sensitivity_solver._solve_single_configuration()
+            metadata["split_packing_sensitivity_executed"] = 1
+            metadata["split_packing_sensitivity_total_cost"] = sensitivity_eval.total_cost
+            metadata["split_packing_sensitivity_route_count"] = sensitivity_eval.route_count
+            metadata["split_packing_sensitivity_reference_total_cost"] = best_solution_eval.total_cost
+            metadata["split_packing_sensitivity_reference_route_count"] = best_solution_eval.route_count
+            if sensitivity_eval.total_cost + COST_IMPROVEMENT_EPS < best_solution_eval.total_cost:
+                sensitivity_metadata["split_packing_sensitivity_executed"] = 1
+                sensitivity_metadata["split_packing_sensitivity_status"] = "selected_as_final"
+                sensitivity_metadata["split_packing_sensitivity_total_cost"] = sensitivity_eval.total_cost
+                sensitivity_metadata["split_packing_sensitivity_route_count"] = sensitivity_eval.route_count
+                sensitivity_metadata["split_packing_sensitivity_reference_total_cost"] = best_solution_eval.total_cost
+                sensitivity_metadata["split_packing_sensitivity_reference_route_count"] = best_solution_eval.route_count
+                sensitivity_metadata["global_validation_status"] = "split_packing_sensitivity_improved"
+                sensitivity_metadata["final_solution_source"] = f"packing_sensitivity_{sensitivity_metadata['final_solution_source']}"
+                best_solution_eval = sensitivity_eval
+                best_solution_routes = sensitivity_routes
+                metadata = sensitivity_metadata
+            else:
+                metadata["split_packing_sensitivity_status"] = "no_improvement"
+
         self._write_outputs(best_solution_eval, best_solution_routes, metadata)
         return best_solution_eval, metadata
 
@@ -2721,6 +4268,11 @@ class Question1Solver:
             index=False,
             encoding=CSV_ENCODING,
         )
+        pd.DataFrame(metadata["route_pool_summary_rows"]).to_csv(
+            self.output_root / "q1_route_pool_summary.csv",
+            index=False,
+            encoding=CSV_ENCODING,
+        )
 
         stale_atom_path = self.output_root / "q1_atoms.csv"
         if stale_atom_path.exists():
@@ -2760,12 +4312,96 @@ class Question1Solver:
             "final_current_single_pairs_inventory_feasible": metadata["final_current_single_pairs_inventory_feasible"],
             "final_routes_with_flexible_units_on_big": metadata["final_routes_with_flexible_units_on_big"],
             "final_flexible_units_on_big_routes": metadata["final_flexible_units_on_big_routes"],
+            "final_piggyback_big_count": metadata["final_piggyback_big_count"],
+            "final_promotion_like_big_count": metadata["final_promotion_like_big_count"],
+            "final_blocking_big_flexible_count": metadata["final_blocking_big_flexible_count"],
+            "final_blocking_big_flexible_unit_count": metadata["final_blocking_big_flexible_unit_count"],
             "diagnostic_unlock_success_count": metadata["diagnostic_unlock_success_count"],
             "diagnostic_promotion_success_count": metadata["diagnostic_promotion_success_count"],
             "route_pool_candidate_count": metadata["route_pool_candidate_count"],
             "route_pool_role_counts": metadata["route_pool_role_counts"],
+            "promotion_like_candidate_count": metadata["promotion_like_candidate_count"],
+            "positive_saving_promotion_like_candidate_count": metadata["positive_saving_promotion_like_candidate_count"],
+            "piggyback_big_candidate_count": metadata["piggyback_big_candidate_count"],
+            "positive_saving_piggyback_big_candidate_count": metadata["positive_saving_piggyback_big_candidate_count"],
+            "candidate_pool_cap_binding_flag": metadata["candidate_pool_cap_binding_flag"],
+            "flex_small_candidate_count_by_size": metadata["flex_small_candidate_count_by_size"],
+            "selected_flex_small_count_by_size": metadata["selected_flex_small_count_by_size"],
             "baseline_route_count": metadata["baseline_route_count"],
             "baseline_single_stop_route_count": metadata["baseline_single_stop_route_count"],
+            "baseline_total_cost": metadata["baseline_total_cost"],
+            "baseline_fuel_3000_used_count": metadata["baseline_fuel_3000_used_count"],
+            "baseline_fuel_3000_free_count": metadata["baseline_fuel_3000_free_count"],
+            "baseline_routes_with_flexible_units_on_big": metadata["baseline_routes_with_flexible_units_on_big"],
+            "baseline_flexible_units_on_big_routes": metadata["baseline_flexible_units_on_big_routes"],
+            "baseline_piggyback_big_count": metadata["baseline_piggyback_big_count"],
+            "baseline_promotion_like_big_count": metadata["baseline_promotion_like_big_count"],
+            "baseline_blocking_big_flexible_count": metadata["baseline_blocking_big_flexible_count"],
+            "baseline_blocking_big_flexible_unit_count": metadata["baseline_blocking_big_flexible_unit_count"],
+            "baseline_bad_big_flexible_route_count": metadata["baseline_bad_big_flexible_route_count"],
+            "baseline_bad_big_flexible_unit_count": metadata["baseline_bad_big_flexible_unit_count"],
+            "baseline_current_single_pairs_feasible": metadata["baseline_current_single_pairs_feasible"],
+            "baseline_current_single_pairs_inventory_feasible": metadata["baseline_current_single_pairs_inventory_feasible"],
+            "global_model_status": metadata["global_model_status"],
+            "global_phase_statuses": metadata["global_phase_statuses"],
+            "global_selected_as_final": metadata["global_selected_as_final"],
+            "global_validation_status": metadata["global_validation_status"],
+            "global_route_pool_candidate_count": metadata["global_route_pool_candidate_count"],
+            "global_unlock_big_mixed_route_count": metadata["global_unlock_big_mixed_route_count"],
+            "global_unlock_big_mixed_unit_count": metadata["global_unlock_big_mixed_unit_count"],
+            "global_unlock_bad_big_flexible_route_count": metadata["global_unlock_bad_big_flexible_route_count"],
+            "global_unlock_bad_big_flexible_unit_count": metadata["global_unlock_bad_big_flexible_unit_count"],
+            "global_unlock_big_route_count": metadata["global_unlock_big_route_count"],
+            "global_big_route_bound_mode": metadata["global_big_route_bound_mode"],
+            "global_pass1_route_count": metadata["global_pass1_route_count"],
+            "global_pass1_single_stop_route_count": metadata["global_pass1_single_stop_route_count"],
+            "global_pass1_selected_singleton_count": metadata["global_pass1_selected_singleton_count"],
+            "global_pass1_selected_promotion_count": metadata["global_pass1_selected_promotion_count"],
+            "global_pass1_selected_promotion_like_count": metadata["global_pass1_selected_promotion_like_count"],
+            "global_pass1_big_route_count": metadata["global_pass1_big_route_count"],
+            "global_pass1_bad_big_flexible_route_count": metadata["global_pass1_bad_big_flexible_route_count"],
+            "global_pass1_bad_big_flexible_unit_count": metadata["global_pass1_bad_big_flexible_unit_count"],
+            "global_pass2_route_count": metadata["global_pass2_route_count"],
+            "global_pass2_single_stop_route_count": metadata["global_pass2_single_stop_route_count"],
+            "global_pass2_selected_singleton_count": metadata["global_pass2_selected_singleton_count"],
+            "global_pass2_selected_promotion_count": metadata["global_pass2_selected_promotion_count"],
+            "global_pass2_selected_promotion_like_count": metadata["global_pass2_selected_promotion_like_count"],
+            "global_pass2_routes_with_flexible_units_on_big": metadata["global_pass2_routes_with_flexible_units_on_big"],
+            "global_pass2_flexible_units_on_big_routes": metadata["global_pass2_flexible_units_on_big_routes"],
+            "global_pass2_big_route_count": metadata["global_pass2_big_route_count"],
+            "global_pass2_bad_big_flexible_route_count": metadata["global_pass2_bad_big_flexible_route_count"],
+            "global_pass2_bad_big_flexible_unit_count": metadata["global_pass2_bad_big_flexible_unit_count"],
+            "global_pass3_route_count": metadata["global_pass3_route_count"],
+            "global_pass3_single_stop_route_count": metadata["global_pass3_single_stop_route_count"],
+            "global_pass3_selected_singleton_count": metadata["global_pass3_selected_singleton_count"],
+            "global_pass3_selected_flexible_singleton_count": metadata["global_pass3_selected_flexible_singleton_count"],
+            "global_pass3_selected_rigid_big_singleton_count": metadata["global_pass3_selected_rigid_big_singleton_count"],
+            "global_pass3_selected_flex_small_count": metadata["global_pass3_selected_flex_small_count"],
+            "global_pass3_selected_promotion_like_count": metadata["global_pass3_selected_promotion_like_count"],
+            "global_pass3_bad_big_flexible_route_count": metadata["global_pass3_bad_big_flexible_route_count"],
+            "global_pass3_big_route_count": metadata["global_pass3_big_route_count"],
+            "global_final_total_cost": metadata["global_final_total_cost"],
+            "global_final_route_count": metadata["global_final_route_count"],
+            "global_final_single_stop_route_count": metadata["global_final_single_stop_route_count"],
+            "global_final_current_single_pairs_feasible": metadata["global_final_current_single_pairs_feasible"],
+            "global_final_current_single_pairs_inventory_feasible": metadata["global_final_current_single_pairs_inventory_feasible"],
+            "global_final_routes_with_flexible_units_on_big": metadata["global_final_routes_with_flexible_units_on_big"],
+            "global_final_flexible_units_on_big_routes": metadata["global_final_flexible_units_on_big_routes"],
+            "global_final_piggyback_big_count": metadata["global_final_piggyback_big_count"],
+            "global_final_promotion_like_big_count": metadata["global_final_promotion_like_big_count"],
+            "global_final_blocking_big_flexible_count": metadata["global_final_blocking_big_flexible_count"],
+            "global_final_blocking_big_flexible_unit_count": metadata["global_final_blocking_big_flexible_unit_count"],
+            "global_fuel_3000_used_count": metadata["global_fuel_3000_used_count"],
+            "global_fuel_3000_free_count": metadata["global_fuel_3000_free_count"],
+            "global_pass1_selected_piggyback_big_count": metadata["global_pass1_selected_piggyback_big_count"],
+            "global_pass1_mixed_big_route_count": metadata["global_pass1_mixed_big_route_count"],
+            "global_pass1_blocking_big_flexible_route_count": metadata["global_pass1_blocking_big_flexible_route_count"],
+            "global_pass1_blocking_big_flexible_unit_count": metadata["global_pass1_blocking_big_flexible_unit_count"],
+            "global_pass2_selected_piggyback_big_count": metadata["global_pass2_selected_piggyback_big_count"],
+            "global_pass2_mixed_big_route_count": metadata["global_pass2_mixed_big_route_count"],
+            "global_pass2_blocking_big_flexible_route_count": metadata["global_pass2_blocking_big_flexible_route_count"],
+            "global_pass2_blocking_big_flexible_unit_count": metadata["global_pass2_blocking_big_flexible_unit_count"],
+            "global_pass3_selected_piggyback_big_count": metadata["global_pass3_selected_piggyback_big_count"],
             "reserve_repair_success_count": metadata["reserve_repair_success_count"],
             "batch_merge_success_count": metadata["batch_merge_success_count"],
             "pre_merge_single_stop_route_count": metadata["pre_merge_single_stop_route_count"],
@@ -2784,6 +4420,16 @@ class Question1Solver:
             "service_unit_count": metadata["service_unit_count"],
             "route_cache_size": metadata["route_cache_size"],
             "elapsed_sec": metadata["elapsed_sec"],
+            "packing_strategy": metadata["packing_strategy"],
+            "route_pool_iteration_count": metadata["route_pool_iteration_count"],
+            "cost_first_improved": metadata["cost_first_improved"],
+            "split_packing_sensitivity_executed": metadata["split_packing_sensitivity_executed"],
+            "split_packing_sensitivity_status": metadata["split_packing_sensitivity_status"],
+            "split_packing_sensitivity_total_cost": metadata["split_packing_sensitivity_total_cost"],
+            "split_packing_sensitivity_route_count": metadata["split_packing_sensitivity_route_count"],
+            "split_packing_sensitivity_reference_total_cost": metadata["split_packing_sensitivity_reference_total_cost"],
+            "split_packing_sensitivity_reference_route_count": metadata["split_packing_sensitivity_reference_route_count"],
+            "final_solution_source": metadata["final_solution_source"],
         }
         (self.output_root / "q1_cost_summary.json").write_text(json.dumps(cost_summary, indent=2), encoding="utf-8")
 
@@ -2793,6 +4439,8 @@ class Question1Solver:
             "## Run Summary",
             f"- Best seed: {metadata['best_seed']}",
             f"- Service unit count: {metadata['service_unit_count']}",
+            f"- Packing strategy: {metadata['packing_strategy']}",
+            f"- Cost-first improved: {metadata['cost_first_improved']}",
             f"- Route count: {solution_eval.route_count}",
             f"- Used vehicle count: {solution_eval.used_vehicle_count}",
             f"- Total cost: {solution_eval.total_cost:.3f}",
@@ -2826,12 +4474,70 @@ class Question1Solver:
             f"- Final current single-pairs inventory-feasible count: {metadata['final_current_single_pairs_inventory_feasible']}",
             f"- Final routes with flexible units on big: {metadata['final_routes_with_flexible_units_on_big']}",
             f"- Final flexible units on big routes: {metadata['final_flexible_units_on_big_routes']}",
+            f"- Final piggyback/promotion-like/blocking big count: {metadata['final_piggyback_big_count']}/{metadata['final_promotion_like_big_count']}/{metadata['final_blocking_big_flexible_count']}",
+            f"- Final blocking big flexible unit count: {metadata['final_blocking_big_flexible_unit_count']}",
             f"- Diagnostic unlock success count: {metadata['diagnostic_unlock_success_count']}",
             f"- Diagnostic promotion success count: {metadata['diagnostic_promotion_success_count']}",
             f"- Route-pool candidate count: {metadata['route_pool_candidate_count']}",
             f"- Route-pool role counts: {json.dumps(metadata['route_pool_role_counts'], ensure_ascii=False)}",
+            f"- Promotion-like candidate count: {metadata['promotion_like_candidate_count']}",
+            f"- Positive-saving promotion-like candidate count: {metadata['positive_saving_promotion_like_candidate_count']}",
+            f"- Piggyback-big candidate count: {metadata['piggyback_big_candidate_count']}",
+            f"- Positive-saving piggyback-big candidate count: {metadata['positive_saving_piggyback_big_candidate_count']}",
+            f"- Candidate-pool cap binding flag: {metadata['candidate_pool_cap_binding_flag']}",
+            f"- Flex-small candidate count by size: {json.dumps(metadata['flex_small_candidate_count_by_size'], ensure_ascii=False)}",
+            f"- Selected flex-small count by size: {json.dumps(metadata['selected_flex_small_count_by_size'], ensure_ascii=False)}",
+            f"- Final solution source: {metadata['final_solution_source']}",
             f"- Baseline route count: {metadata['baseline_route_count']}",
             f"- Baseline single-stop route count: {metadata['baseline_single_stop_route_count']}",
+            f"- Baseline total cost: {metadata['baseline_total_cost']:.3f}",
+            f"- Baseline fuel 3000 used/free: {metadata['baseline_fuel_3000_used_count']}/{metadata['baseline_fuel_3000_free_count']}",
+            f"- Baseline routes with flexible units on big: {metadata['baseline_routes_with_flexible_units_on_big']}",
+            f"- Baseline flexible units on big routes: {metadata['baseline_flexible_units_on_big_routes']}",
+            f"- Baseline piggyback/promotion-like/blocking big count: {metadata['baseline_piggyback_big_count']}/{metadata['baseline_promotion_like_big_count']}/{metadata['baseline_blocking_big_flexible_count']}",
+            f"- Baseline blocking big flexible unit count: {metadata['baseline_blocking_big_flexible_unit_count']}",
+            f"- Baseline bad big-flexible route/unit count: {metadata['baseline_bad_big_flexible_route_count']}/{metadata['baseline_bad_big_flexible_unit_count']}",
+            f"- Baseline current single-pairs feasible/inventory-feasible: {metadata['baseline_current_single_pairs_feasible']}/{metadata['baseline_current_single_pairs_inventory_feasible']}",
+            f"- Global model status: {metadata['global_model_status']}",
+            f"- Global selected as final: {metadata['global_selected_as_final']}",
+            f"- Global validation status: {metadata['global_validation_status']}",
+            f"- Global route-pool candidate count: {metadata['global_route_pool_candidate_count']}",
+            f"- Route-pool iterations configured: {metadata['route_pool_iteration_count']}",
+            f"- Global pass1 route count: {metadata['global_pass1_route_count']}",
+            f"- Global pass1 single-stop route count: {metadata['global_pass1_single_stop_route_count']}",
+            f"- Global pass1 selected singleton count: {metadata['global_pass1_selected_singleton_count']}",
+            f"- Global pass1 selected promotion count: {metadata['global_pass1_selected_promotion_count']}",
+            f"- Global pass1 selected promotion-like/piggyback count: {metadata['global_pass1_selected_promotion_like_count']}/{metadata['global_pass1_selected_piggyback_big_count']}",
+            f"- Global pass1 big-route count: {metadata['global_pass1_big_route_count']}",
+            f"- Global pass1 mixed/blocking big route count: {metadata['global_pass1_mixed_big_route_count']}/{metadata['global_pass1_blocking_big_flexible_route_count']}",
+            f"- Global pass1 bad big-flexible route/unit count: {metadata['global_pass1_bad_big_flexible_route_count']}/{metadata['global_pass1_bad_big_flexible_unit_count']}",
+            f"- Global pass2 route count: {metadata['global_pass2_route_count']}",
+            f"- Global pass2 single-stop route count: {metadata['global_pass2_single_stop_route_count']}",
+            f"- Global pass2 selected singleton count: {metadata['global_pass2_selected_singleton_count']}",
+            f"- Global pass2 selected promotion count: {metadata['global_pass2_selected_promotion_count']}",
+            f"- Global pass2 selected promotion-like/piggyback count: {metadata['global_pass2_selected_promotion_like_count']}/{metadata['global_pass2_selected_piggyback_big_count']}",
+            f"- Global pass2 routes with flexible units on big: {metadata['global_pass2_routes_with_flexible_units_on_big']}",
+            f"- Global pass2 flexible units on big routes: {metadata['global_pass2_flexible_units_on_big_routes']}",
+            f"- Global pass2 big-route count: {metadata['global_pass2_big_route_count']}",
+            f"- Global pass2 mixed/blocking big route count: {metadata['global_pass2_mixed_big_route_count']}/{metadata['global_pass2_blocking_big_flexible_route_count']}",
+            f"- Global pass2 bad big-flexible route/unit count: {metadata['global_pass2_bad_big_flexible_route_count']}/{metadata['global_pass2_bad_big_flexible_unit_count']}",
+            f"- Global pass3 route count: {metadata['global_pass3_route_count']}",
+            f"- Global pass3 single-stop route count: {metadata['global_pass3_single_stop_route_count']}",
+            f"- Global pass3 selected singleton/flexible-singleton/rigid-big-singleton count: {metadata['global_pass3_selected_singleton_count']}/{metadata['global_pass3_selected_flexible_singleton_count']}/{metadata['global_pass3_selected_rigid_big_singleton_count']}",
+            f"- Global pass3 selected flex-small count: {metadata['global_pass3_selected_flex_small_count']}",
+            f"- Global pass3 selected promotion-like/piggyback count: {metadata['global_pass3_selected_promotion_like_count']}/{metadata['global_pass3_selected_piggyback_big_count']}",
+            f"- Global pass3 bad big-flexible route count: {metadata['global_pass3_bad_big_flexible_route_count']}",
+            f"- Global pass3 big-route count: {metadata['global_pass3_big_route_count']}",
+            f"- Global final total cost: {metadata['global_final_total_cost']}",
+            f"- Global final route count: {metadata['global_final_route_count']}",
+            f"- Global final single-stop route count: {metadata['global_final_single_stop_route_count']}",
+            f"- Global final current single-pairs feasible/inventory-feasible: {metadata['global_final_current_single_pairs_feasible']}/{metadata['global_final_current_single_pairs_inventory_feasible']}",
+            f"- Global final routes with flexible units on big: {metadata['global_final_routes_with_flexible_units_on_big']}",
+            f"- Global final flexible units on big routes: {metadata['global_final_flexible_units_on_big_routes']}",
+            f"- Global final piggyback/promotion-like/blocking big count: {metadata['global_final_piggyback_big_count']}/{metadata['global_final_promotion_like_big_count']}/{metadata['global_final_blocking_big_flexible_count']}",
+            f"- Global fuel 3000 used/free: {metadata['global_fuel_3000_used_count']}/{metadata['global_fuel_3000_free_count']}",
+            f"- Split/packing sensitivity executed/status: {metadata['split_packing_sensitivity_executed']}/{metadata['split_packing_sensitivity_status']}",
+            f"- Split/packing sensitivity total cost/route count: {metadata['split_packing_sensitivity_total_cost']}/{metadata['split_packing_sensitivity_route_count']}",
             f"- Reserve repair success count: {metadata['reserve_repair_success_count']}",
             f"- Batch merge success count: {metadata['batch_merge_success_count']}",
             f"- Pre-merge single-stop route count: {metadata['pre_merge_single_stop_route_count']}",
@@ -2850,6 +4556,20 @@ class Question1Solver:
             "",
             "## Per-Seed Best",
         ]
+        report_lines.extend(
+            [
+                "",
+                "## Cost-First MILP Phases",
+                *[
+                    "- "
+                    + json.dumps(
+                        phase_status,
+                        ensure_ascii=False,
+                    )
+                    for phase_status in metadata["global_phase_statuses"]
+                ],
+            ]
+        )
         for item in metadata["run_records"]:
             report_lines.append(
                 f"- Seed {item['seed']}: best cost {item['best_cost']:.3f}, routes {item['route_count']}, "

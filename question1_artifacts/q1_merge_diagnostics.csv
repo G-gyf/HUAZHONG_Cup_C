@@ -1,6 +1,3 @@
-﻿source_state,candidate_type,cluster_route_ids,cluster_unit_ids,old_route_count,new_route_count,old_flexible_big_routes,new_flexible_big_routes,old_flexible_big_units,new_flexible_big_units,accepted,old_single_stop_count,new_single_stop_count
-diagnostic,release,"(20,)","93,15,46,142",1,2,1.0,0.0,3.0,0.0,1,,
-diagnostic,release,"(3,)","29,18,49",1,2,1.0,0.0,2.0,0.0,1,,
-diagnostic,release,"(60,)","1,69,31",1,2,1.0,0.0,2.0,0.0,1,,
-diagnostic,release,"(63,)","80,20",1,2,1.0,0.0,2.0,0.0,1,,
-diagnostic,promotion,"(83, 115, 119)","34,81,85,17",3,2,,,,,1,2.0,0.0
+﻿phase,stage,status,fallback_used,selected_route_count,objective_value,pass_label,big_route_bound_mode
+cost_first_total_cost,cost_first,optimal,0,132,87988.73644543935,pass1,
+cost_first_total_cost,cost_first,optimal,0,132,87616.6097988012,pass2,

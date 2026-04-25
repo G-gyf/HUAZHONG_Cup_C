@@ -1,0 +1,115 @@
+{
+  "green_zone_radius_km": 10.0,
+  "service_time_min": 20,
+  "policy_ban_start_min": 0,
+  "policy_ban_end_min": 480,
+  "day_end_min": 780,
+  "speed_segments": [
+    {
+      "segment_id": 1,
+      "traffic_state": "congested",
+      "start_min": 0,
+      "end_min": 60,
+      "speed_kmh": 9.8
+    },
+    {
+      "segment_id": 2,
+      "traffic_state": "free_flow",
+      "start_min": 60,
+      "end_min": 120,
+      "speed_kmh": 55.3
+    },
+    {
+      "segment_id": 3,
+      "traffic_state": "normal",
+      "start_min": 120,
+      "end_min": 210,
+      "speed_kmh": 35.4
+    },
+    {
+      "segment_id": 4,
+      "traffic_state": "congested",
+      "start_min": 210,
+      "end_min": 300,
+      "speed_kmh": 9.8
+    },
+    {
+      "segment_id": 5,
+      "traffic_state": "free_flow",
+      "start_min": 300,
+      "end_min": 420,
+      "speed_kmh": 55.3
+    },
+    {
+      "segment_id": 6,
+      "traffic_state": "normal",
+      "start_min": 420,
+      "end_min": 540,
+      "speed_kmh": 35.4
+    },
+    {
+      "segment_id": 7,
+      "traffic_state": "congested",
+      "start_min": 540,
+      "end_min": 630,
+      "speed_kmh": 9.8
+    },
+    {
+      "segment_id": 8,
+      "traffic_state": "free_flow",
+      "start_min": 630,
+      "end_min": 720,
+      "speed_kmh": 55.3
+    },
+    {
+      "segment_id": 9,
+      "traffic_state": "normal",
+      "start_min": 720,
+      "end_min": 780,
+      "speed_kmh": 35.4
+    }
+  ],
+  "vehicle_capacity_reference": [
+    {
+      "vehicle_type": "fuel_3000",
+      "power_type": "fuel",
+      "capacity_kg": 3000,
+      "capacity_m3": 13.5,
+      "vehicle_count": 60
+    },
+    {
+      "vehicle_type": "fuel_1500",
+      "power_type": "fuel",
+      "capacity_kg": 1500,
+      "capacity_m3": 10.8,
+      "vehicle_count": 50
+    },
+    {
+      "vehicle_type": "fuel_1250",
+      "power_type": "fuel",
+      "capacity_kg": 1250,
+      "capacity_m3": 6.5,
+      "vehicle_count": 50
+    },
+    {
+      "vehicle_type": "ev_3000",
+      "power_type": "ev",
+      "capacity_kg": 3000,
+      "capacity_m3": 15.0,
+      "vehicle_count": 10
+    },
+    {
+      "vehicle_type": "ev_1250",
+      "power_type": "ev",
+      "capacity_kg": 1250,
+      "capacity_m3": 8.5,
+      "vehicle_count": 15
+    }
+  ],
+  "imputation_models": {
+    "weight_fit_slope": 398.67584467715733,
+    "weight_fit_intercept": -11.712625928661065,
+    "volume_fit_slope": 0.0023439149952689123,
+    "volume_fit_intercept": 0.05103506662049447
+  }
+}

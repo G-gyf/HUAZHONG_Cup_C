@@ -1,0 +1,2 @@
+﻿mandatory_ev_customer_count,mandatory_ev_active_customer_count,mandatory_ev_total_orders,mandatory_ev_total_weight,mandatory_ev_total_volume,optimistic_lb_trips_weight,optimistic_lb_trips_volume,one_wave_ev_fleet_weight_capacity,one_wave_ev_fleet_volume_capacity,within_one_wave_ev_fleet_capacity
+9,8,226,30149.461954200156,84.00564787051664,11,6,48750.0,277.5,True

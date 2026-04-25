@@ -1,0 +1,5 @@
+﻿event_id,event_time_min,event_time_hhmm,event_type,target_customer,node_from,node_to,new_tw_start,new_tw_end,weight_kg,volume_m3,direct_onboard_route_count,direct_depot_route_count,initial_t0_min,initial_t0_hhmm,expansion_round_count,included_unlaunched_route_count,status,failure_reason
+E1,60,09:00,new_order,23,,23.0,250.0,315.0,900.0,3.0,0,0,315.0,13:15,1,31,satisfied,
+E2,360,14:00,cancel,19,19.0,,,,,,0,1,422.8,15:03,1,6,satisfied,
+E3,380,14:20,tighten_tw,54,54.0,54.0,560.0,568.0,,,3,2,788.475,21:08,1,64,satisfied,
+E4,450,15:30,relocate,71,71.0,96.0,679.0,765.0,,,1,2,876.907,22:37,1,49,satisfied,

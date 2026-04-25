@@ -1,0 +1,6 @@
+﻿scenario_name,speed_scale,input_root,min_speed_kmh,max_speed_kmh
+speed_scale_090,0.9,C:\Desktop\华中杯A题\question1_speed_sensitivity_analysis\inputs\speed_scale_090\preprocess_artifacts,8.82,49.769999999999996
+speed_scale_095,0.95,C:\Desktop\华中杯A题\question1_speed_sensitivity_analysis\inputs\speed_scale_095\preprocess_artifacts,9.31,52.535
+speed_scale_100,1.0,C:\Desktop\华中杯A题\question1_speed_sensitivity_analysis\inputs\speed_scale_100\preprocess_artifacts,9.8,55.3
+speed_scale_105,1.05,C:\Desktop\华中杯A题\question1_speed_sensitivity_analysis\inputs\speed_scale_105\preprocess_artifacts,10.290000000000001,58.065
+speed_scale_110,1.1,C:\Desktop\华中杯A题\question1_speed_sensitivity_analysis\inputs\speed_scale_110\preprocess_artifacts,10.780000000000001,60.83

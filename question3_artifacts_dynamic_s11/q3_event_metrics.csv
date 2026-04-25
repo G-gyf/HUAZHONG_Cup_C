@@ -1,0 +1,5 @@
+﻿event_id,event_time_min,event_time_hhmm,t0_min,t0_hhmm,realized_cost_to_event,remaining_total_cost,projected_full_day_cost,cost_change_vs_q2_baseline,remaining_total_late_min,projected_full_day_route_count,route_count_change_vs_q2_baseline,unmet_event_count,modified_vehicle_count,switched_depot_unit_count,policy_violation_count,mandatory_ev_served_by_non_ev_count,fuel_route_green_zone_pre16_visit_count,one_route_one_vehicle_ok,no_mid_arc_change_ok,no_restock_ok
+E1,60,09:00,315.0,13:15,833.911111,89731.463962,90565.375073,715.361635,134.829454,133,1,0,8,0,0,0,0,1,1,1
+E2,360,14:00,422.8,15:03,35006.459339,56379.983826,91386.443166,1536.429727,185.515953,134,2,0,2,0,0,0,0,1,1,1
+E3,380,14:20,788.475,21:08,39982.70149,52224.971855,92207.673345,2357.659907,329.775078,135,3,0,22,1,0,0,0,1,1,1
+E4,450,15:30,876.907,22:37,51252.051154,41839.953667,93092.004822,3241.991383,651.115667,136,4,0,5,1,0,0,0,1,1,1

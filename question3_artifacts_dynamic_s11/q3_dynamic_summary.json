@@ -1,0 +1,37 @@
+{
+  "baseline_root": "C:\\Desktop\\华中杯A题\\question2_artifacts_hybrid_standard_s11",
+  "seed": 11,
+  "q2_baseline_total_cost": 89850.01343848961,
+  "q2_baseline_route_count": 132,
+  "event_count": 4,
+  "processed_event_ids": [
+    "E1",
+    "E2",
+    "E3",
+    "E4"
+  ],
+  "final_event_time_min": 450.0,
+  "final_event_time_hhmm": "15:30",
+  "realized_cost_to_event": 51252.05115443217,
+  "remaining_total_cost": 41839.95366711489,
+  "projected_full_day_cost": 93092.00482154706,
+  "cost_change_vs_q2_baseline": 3241.9913830574515,
+  "remaining_total_late_min": 651.11566696167,
+  "projected_full_day_route_count": 136,
+  "route_count_change_vs_q2_baseline": 4,
+  "unmet_event_count": 0,
+  "policy_violation_count": 0,
+  "mandatory_ev_served_by_non_ev_count": 0,
+  "fuel_route_green_zone_pre16_visit_count": 0,
+  "one_route_one_vehicle_ok": 1,
+  "no_mid_arc_change_ok": 1,
+  "no_restock_ok": 1,
+  "active_remaining_route_count": 103,
+  "unused_depot_slots_by_type": {
+    "ev_1250": 0,
+    "ev_3000": 0,
+    "fuel_1250": 49,
+    "fuel_1500": 0,
+    "fuel_3000": 0
+  }
+}

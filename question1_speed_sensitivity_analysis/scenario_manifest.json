@@ -1,0 +1,37 @@
+[
+  {
+    "scenario_name": "speed_scale_090",
+    "speed_scale": 0.9,
+    "input_root": "C:\\Desktop\\华中杯A题\\question1_speed_sensitivity_analysis\\inputs\\speed_scale_090\\preprocess_artifacts",
+    "min_speed_kmh": 8.82,
+    "max_speed_kmh": 49.769999999999996
+  },
+  {
+    "scenario_name": "speed_scale_095",
+    "speed_scale": 0.95,
+    "input_root": "C:\\Desktop\\华中杯A题\\question1_speed_sensitivity_analysis\\inputs\\speed_scale_095\\preprocess_artifacts",
+    "min_speed_kmh": 9.31,
+    "max_speed_kmh": 52.535
+  },
+  {
+    "scenario_name": "speed_scale_100",
+    "speed_scale": 1.0,
+    "input_root": "C:\\Desktop\\华中杯A题\\question1_speed_sensitivity_analysis\\inputs\\speed_scale_100\\preprocess_artifacts",
+    "min_speed_kmh": 9.8,
+    "max_speed_kmh": 55.3
+  },
+  {
+    "scenario_name": "speed_scale_105",
+    "speed_scale": 1.05,
+    "input_root": "C:\\Desktop\\华中杯A题\\question1_speed_sensitivity_analysis\\inputs\\speed_scale_105\\preprocess_artifacts",
+    "min_speed_kmh": 10.290000000000001,
+    "max_speed_kmh": 58.065
+  },
+  {
+    "scenario_name": "speed_scale_110",
+    "speed_scale": 1.1,
+    "input_root": "C:\\Desktop\\华中杯A题\\question1_speed_sensitivity_analysis\\inputs\\speed_scale_110\\preprocess_artifacts",
+    "min_speed_kmh": 10.780000000000001,
+    "max_speed_kmh": 60.83
+  }
+]

@@ -1,0 +1,113 @@
+{
+  "scenario_count": 5,
+  "seed_count": 3,
+  "run_count": 15,
+  "total_elapsed_sec": 295.3584494590759,
+  "runs": [
+    {
+      "scenario_name": "speed_scale_090",
+      "seed": 11,
+      "input_root": "C:\\Desktop\\华中杯A题\\question1_speed_sensitivity_analysis\\inputs\\speed_scale_090\\preprocess_artifacts",
+      "output_root": "C:\\Desktop\\华中杯A题\\question1_speed_sensitivity_analysis\\outputs\\speed_scale_090\\seed_11",
+      "elapsed_sec": 19.038437366485596
+    },
+    {
+      "scenario_name": "speed_scale_090",
+      "seed": 17,
+      "input_root": "C:\\Desktop\\华中杯A题\\question1_speed_sensitivity_analysis\\inputs\\speed_scale_090\\preprocess_artifacts",
+      "output_root": "C:\\Desktop\\华中杯A题\\question1_speed_sensitivity_analysis\\outputs\\speed_scale_090\\seed_17",
+      "elapsed_sec": 18.95295000076294
+    },
+    {
+      "scenario_name": "speed_scale_090",
+      "seed": 23,
+      "input_root": "C:\\Desktop\\华中杯A题\\question1_speed_sensitivity_analysis\\inputs\\speed_scale_090\\preprocess_artifacts",
+      "output_root": "C:\\Desktop\\华中杯A题\\question1_speed_sensitivity_analysis\\outputs\\speed_scale_090\\seed_23",
+      "elapsed_sec": 19.003416538238525
+    },
+    {
+      "scenario_name": "speed_scale_095",
+      "seed": 11,
+      "input_root": "C:\\Desktop\\华中杯A题\\question1_speed_sensitivity_analysis\\inputs\\speed_scale_095\\preprocess_artifacts",
+      "output_root": "C:\\Desktop\\华中杯A题\\question1_speed_sensitivity_analysis\\outputs\\speed_scale_095\\seed_11",
+      "elapsed_sec": 19.436002492904663
+    },
+    {
+      "scenario_name": "speed_scale_095",
+      "seed": 17,
+      "input_root": "C:\\Desktop\\华中杯A题\\question1_speed_sensitivity_analysis\\inputs\\speed_scale_095\\preprocess_artifacts",
+      "output_root": "C:\\Desktop\\华中杯A题\\question1_speed_sensitivity_analysis\\outputs\\speed_scale_095\\seed_17",
+      "elapsed_sec": 20.02988839149475
+    },
+    {
+      "scenario_name": "speed_scale_095",
+      "seed": 23,
+      "input_root": "C:\\Desktop\\华中杯A题\\question1_speed_sensitivity_analysis\\inputs\\speed_scale_095\\preprocess_artifacts",
+      "output_root": "C:\\Desktop\\华中杯A题\\question1_speed_sensitivity_analysis\\outputs\\speed_scale_095\\seed_23",
+      "elapsed_sec": 19.472995042800903
+    },
+    {
+      "scenario_name": "speed_scale_100",
+      "seed": 11,
+      "input_root": "C:\\Desktop\\华中杯A题\\question1_speed_sensitivity_analysis\\inputs\\speed_scale_100\\preprocess_artifacts",
+      "output_root": "C:\\Desktop\\华中杯A题\\question1_speed_sensitivity_analysis\\outputs\\speed_scale_100\\seed_11",
+      "elapsed_sec": 16.383678913116455
+    },
+    {
+      "scenario_name": "speed_scale_100",
+      "seed": 17,
+      "input_root": "C:\\Desktop\\华中杯A题\\question1_speed_sensitivity_analysis\\inputs\\speed_scale_100\\preprocess_artifacts",
+      "output_root": "C:\\Desktop\\华中杯A题\\question1_speed_sensitivity_analysis\\outputs\\speed_scale_100\\seed_17",
+      "elapsed_sec": 18.889166831970215
+    },
+    {
+      "scenario_name": "speed_scale_100",
+      "seed": 23,
+      "input_root": "C:\\Desktop\\华中杯A题\\question1_speed_sensitivity_analysis\\inputs\\speed_scale_100\\preprocess_artifacts",
+      "output_root": "C:\\Desktop\\华中杯A题\\question1_speed_sensitivity_analysis\\outputs\\speed_scale_100\\seed_23",
+      "elapsed_sec": 19.26551365852356
+    },
+    {
+      "scenario_name": "speed_scale_105",
+      "seed": 11,
+      "input_root": "C:\\Desktop\\华中杯A题\\question1_speed_sensitivity_analysis\\inputs\\speed_scale_105\\preprocess_artifacts",
+      "output_root": "C:\\Desktop\\华中杯A题\\question1_speed_sensitivity_analysis\\outputs\\speed_scale_105\\seed_11",
+      "elapsed_sec": 19.083788871765137
+    },
+    {
+      "scenario_name": "speed_scale_105",
+      "seed": 17,
+      "input_root": "C:\\Desktop\\华中杯A题\\question1_speed_sensitivity_analysis\\inputs\\speed_scale_105\\preprocess_artifacts",
+      "output_root": "C:\\Desktop\\华中杯A题\\question1_speed_sensitivity_analysis\\outputs\\speed_scale_105\\seed_17",
+      "elapsed_sec": 19.063817739486694
+    },
+    {
+      "scenario_name": "speed_scale_105",
+      "seed": 23,
+      "input_root": "C:\\Desktop\\华中杯A题\\question1_speed_sensitivity_analysis\\inputs\\speed_scale_105\\preprocess_artifacts",
+      "output_root": "C:\\Desktop\\华中杯A题\\question1_speed_sensitivity_analysis\\outputs\\speed_scale_105\\seed_23",
+      "elapsed_sec": 19.069244861602783
+    },
+    {
+      "scenario_name": "speed_scale_110",
+      "seed": 11,
+      "input_root": "C:\\Desktop\\华中杯A题\\question1_speed_sensitivity_analysis\\inputs\\speed_scale_110\\preprocess_artifacts",
+      "output_root": "C:\\Desktop\\华中杯A题\\question1_speed_sensitivity_analysis\\outputs\\speed_scale_110\\seed_11",
+      "elapsed_sec": 19.169899463653564
+    },
+    {
+      "scenario_name": "speed_scale_110",
+      "seed": 17,
+      "input_root": "C:\\Desktop\\华中杯A题\\question1_speed_sensitivity_analysis\\inputs\\speed_scale_110\\preprocess_artifacts",
+      "output_root": "C:\\Desktop\\华中杯A题\\question1_speed_sensitivity_analysis\\outputs\\speed_scale_110\\seed_17",
+      "elapsed_sec": 18.975093841552734
+    },
+    {
+      "scenario_name": "speed_scale_110",
+      "seed": 23,
+      "input_root": "C:\\Desktop\\华中杯A题\\question1_speed_sensitivity_analysis\\inputs\\speed_scale_110\\preprocess_artifacts",
+      "output_root": "C:\\Desktop\\华中杯A题\\question1_speed_sensitivity_analysis\\outputs\\speed_scale_110\\seed_23",
+      "elapsed_sec": 21.395861387252808
+    }
+  ]
+}

@@ -1,0 +1,3 @@
+﻿order_id,weight_original,volume_original,cust_id,weight,volume,is_imputed_weight,is_imputed_volume,weight_impute_method,volume_impute_method,is_imputed_any,is_oversize_order
+1686,5987.0501,13.79751,31,5987.0501,13.79751,False,False,,,False,True
+1287,3165.69,8.70067,55,3165.69,8.70067,False,False,,,False,True

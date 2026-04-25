@@ -8,32 +8,36 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import seaborn as sns
+from matplotlib import patheffects as pe
 
 
 GREEN_ZONE_RADIUS_KM = 10.0
+GREEN_ZONE_FILL = "#d9f0e5"
+GREEN_ZONE_EDGE = "#66a182"
 
 VEHICLE_COLORS = {
-    "fuel_3000": "#c2410c",
-    "ev_3000": "#0f766e",
-    "fuel_1500": "#b45309",
-    "fuel_1250": "#92400e",
-    "ev_1250": "#1d4ed8",
+    "fuel_3000": "#4c566a",
+    "fuel_1500": "#5b8fb9",
+    "ev_3000": "#2a9d8f",
+    "ev_1250": "#7cae5a",
+    "fuel_1250": "#c98c64",
 }
 
 FAMILY_COLORS = {
-    "Rigid Big": "#9a3412",
-    "Piggyback Big": "#ea580c",
-    "Promotion-Like Big": "#0f766e",
-    "Blocking Big": "#7f1d1d",
-    "Flex Small": "#2563eb",
-    "Support": "#64748b",
+    "Rigid Big": "#4c566a",
+    "Piggyback Big": "#c98c64",
+    "Promotion-Like Big": "#2a9d8f",
+    "Blocking Big": "#7a516b",
+    "Flex Small": "#5b8fb9",
+    "Support": "#94a3b8",
 }
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Generate figures for question 1 results.")
-    parser.add_argument("--artifacts-root", type=Path, default=Path.cwd() / "question1_artifacts")
+    parser.add_argument("--artifacts-root", type=Path, default=Path.cwd() / "question1_artifacts_hybrid_coupled_heavy_s11")
     parser.add_argument("--preprocess-root", type=Path, default=Path.cwd() / "preprocess_artifacts")
+    parser.add_argument("--output-dir", type=Path, default=None)
     return parser.parse_args()
 
 
@@ -42,15 +46,16 @@ def set_plot_style() -> None:
     plt.rcParams.update(
         {
             "figure.dpi": 170,
-            "axes.facecolor": "#f8fafc",
-            "figure.facecolor": "#f8fafc",
-            "savefig.facecolor": "#f8fafc",
+            "savefig.dpi": 220,
+            "axes.facecolor": "#fbfdff",
+            "figure.facecolor": "#fbfdff",
+            "savefig.facecolor": "#fbfdff",
             "axes.edgecolor": "#cbd5e1",
             "axes.titleweight": "bold",
             "axes.labelcolor": "#0f172a",
             "xtick.color": "#334155",
             "ytick.color": "#334155",
-            "grid.color": "#e2e8f0",
+            "grid.color": "#dbe4ee",
             "font.size": 10,
         }
     )
@@ -85,6 +90,34 @@ def save_figure(fig: plt.Figure, path: Path) -> None:
     plt.close(fig)
 
 
+def draw_soft_route(
+    ax: plt.Axes,
+    x: list[float],
+    y: list[float],
+    color: str,
+    linewidth: float,
+    alpha: float,
+    zorder: float,
+    halo_width: float = 1.2,
+) -> None:
+    line = ax.plot(
+        x,
+        y,
+        color=color,
+        linewidth=linewidth,
+        alpha=alpha,
+        solid_capstyle="round",
+        zorder=zorder,
+    )[0]
+    if halo_width > 0.0:
+        line.set_path_effects(
+            [
+                pe.Stroke(linewidth=linewidth + halo_width, foreground="#fbfdff"),
+                pe.Normal(),
+            ]
+        )
+
+
 def family_label(row: pd.Series) -> str:
     if int(row.get("blocking_big_flexible_route_flag", 0)) == 1:
         return "Blocking Big"
@@ -100,10 +133,10 @@ def family_label(row: pd.Series) -> str:
 
 
 def build_plot_context(artifacts_root: Path, preprocess_root: Path) -> dict[str, object]:
-    cost_summary = json.loads((artifacts_root / "q1_cost_summary.json").read_text(encoding="utf-8"))
-    route_df = pd.read_csv(artifacts_root / "q1_route_summary.csv")
-    stop_df = pd.read_csv(artifacts_root / "q1_stop_schedule.csv")
-    route_pool_df = pd.read_csv(artifacts_root / "q1_route_pool_summary.csv")
+    cost_summary = json.loads((artifacts_root / "q1_hybrid_cost_summary.json").read_text(encoding="utf-8"))
+    route_df = pd.read_csv(artifacts_root / "q1_hybrid_route_summary.csv")
+    stop_df = pd.read_csv(artifacts_root / "q1_hybrid_stop_schedule.csv")
+    route_pool_df = pd.read_csv(artifacts_root / "q1_hybrid_route_pool_summary.csv")
     customer_df = pd.read_csv(preprocess_root / "tables" / "customer_master_98.csv")
 
     route_df["unit_count"] = route_df["unit_sequence"].astype(str).apply(lambda text: len(text.split(",")))
@@ -183,13 +216,13 @@ def build_route_paths(route_df: pd.DataFrame, stop_df: pd.DataFrame) -> list[dic
 
 
 def draw_base_map(ax: plt.Axes, active_customers: pd.DataFrame, subtitle: str | None = None) -> None:
-    ax.add_patch(plt.Circle((0, 0), GREEN_ZONE_RADIUS_KM, color="#bbf7d0", alpha=0.14, ec="#22c55e", lw=2))
+    ax.add_patch(plt.Circle((0, 0), GREEN_ZONE_RADIUS_KM, color=GREEN_ZONE_FILL, alpha=0.24, ec=GREEN_ZONE_EDGE, lw=2))
     ax.scatter(
         active_customers["x_km"],
         active_customers["y_km"],
         s=18,
         c="#cbd5e1",
-        alpha=0.65,
+        alpha=0.58,
         edgecolor="none",
         zorder=1,
     )
@@ -368,7 +401,7 @@ def plot_vehicle_mix_and_stops(route_df: pd.DataFrame, figures_dir: Path) -> Non
     stop_mix.plot(
         kind="bar",
         stacked=True,
-        color=["#94a3b8", "#60a5fa", "#0f766e"],
+        color=["#cbd5e1", "#9db6d5", "#6b9a95"],
         ax=axes[1],
         width=0.68,
     )
@@ -450,24 +483,24 @@ def plot_route_timeline(route_df: pd.DataFrame, figures_dir: Path) -> None:
 
 def plot_big_route_structure(cost_summary: dict[str, object], route_pool_df: pd.DataFrame, figures_dir: Path) -> None:
     families = ["Rigid Big", "Piggyback Big", "Promotion-Like Big", "Blocking Big"]
-    baseline_counts = (
-        route_pool_df.loc[route_pool_df["selected_in_baseline"].eq(1) & route_pool_df["family"].isin(families)]
+    pass1_counts = (
+        route_pool_df.loc[route_pool_df["selected_in_pass1"].eq(1) & route_pool_df["family"].isin(families)]
         .groupby("family")
         .size()
         .reindex(families, fill_value=0)
         .tolist()
     )
     final_counts = (
-        route_pool_df.loc[route_pool_df["selected_in_global"].eq(1) & route_pool_df["family"].isin(families)]
+        route_pool_df.loc[route_pool_df["selected_in_final"].eq(1) & route_pool_df["family"].isin(families)]
         .groupby("family")
         .size()
         .reindex(families, fill_value=0)
         .tolist()
     )
 
-    selected_global = route_pool_df.loc[route_pool_df["selected_in_global"].eq(1)].copy()
+    selected_final = route_pool_df.loc[route_pool_df["selected_in_final"].eq(1)].copy()
     saving_df = (
-        selected_global.groupby("family", as_index=False)["current_cost_saving"]
+        selected_final.groupby("family", as_index=False)["current_cost_saving"]
         .sum()
         .query("family in @families")
         .set_index("family")
@@ -478,12 +511,12 @@ def plot_big_route_structure(cost_summary: dict[str, object], route_pool_df: pd.
     fig, axes = plt.subplots(1, 2, figsize=(14.2, 5.8))
     x = np.arange(len(families))
     width = 0.35
-    axes[0].bar(x - width / 2.0, baseline_counts, width=width, color="#94a3b8", label="Baseline")
+    axes[0].bar(x - width / 2.0, pass1_counts, width=width, color="#94a3b8", label="Pass 1")
     axes[0].bar(x + width / 2.0, final_counts, width=width, color="#0f766e", label="Final")
     axes[0].set_xticks(x)
     axes[0].set_xticklabels(families, rotation=12)
     axes[0].set_ylabel("Route count")
-    axes[0].set_title("Big-Route Structure: Baseline vs Final")
+    axes[0].set_title("Big-Route Structure: Pass 1 vs Final")
     axes[0].legend(loc="upper right")
 
     sns.barplot(
@@ -546,7 +579,7 @@ def plot_route_cost_pareto(route_df: pd.DataFrame, figures_dir: Path) -> None:
 
 def plot_spatial_map(active_customers: pd.DataFrame, figures_dir: Path) -> None:
     fig, ax = plt.subplots(figsize=(9.5, 8.8))
-    ax.add_patch(plt.Circle((0, 0), GREEN_ZONE_RADIUS_KM, color="#a7f3d0", alpha=0.18, ec="#059669", lw=2))
+    ax.add_patch(plt.Circle((0, 0), GREEN_ZONE_RADIUS_KM, color=GREEN_ZONE_FILL, alpha=0.24, ec=GREEN_ZONE_EDGE, lw=2))
     ax.scatter([0], [0], s=140, c="#0f172a", marker="s", label="Depot / origin")
 
     for vehicle_type, sub_df in active_customers.groupby("vehicle_type"):
@@ -569,8 +602,8 @@ def plot_spatial_map(active_customers: pd.DataFrame, figures_dir: Path) -> None:
                 s=np.clip(sub_df.loc[split_mask, "total_weight"] / 9.0 + 22.0, 34.0, 240.0),
                 c=color,
                 alpha=0.92,
-                edgecolor="#7f1d1d",
-                linewidth=1.5,
+                edgecolor="#1f2937",
+                linewidth=1.35,
             )
 
     ax.set_title("Customer Spatial Pattern by Dominant Assigned Vehicle")
@@ -581,7 +614,7 @@ def plot_spatial_map(active_customers: pd.DataFrame, figures_dir: Path) -> None:
     ax.text(
         0.02,
         0.02,
-        "Red outline marks customers visited by more than one route.",
+        "Dark outline marks customers visited by more than one route.",
         transform=ax.transAxes,
         ha="left",
         va="bottom",
@@ -603,7 +636,7 @@ def plot_candidate_pool_mix(route_pool_df: pd.DataFrame, figures_dir: Path) -> N
         .reset_index()
     )
     selected_counts = (
-        pool_view.loc[pool_view["selected_in_global"].eq(1)]
+        pool_view.loc[pool_view["selected_in_final"].eq(1)]
         .groupby("family", as_index=False)
         .size()
         .set_index("family")
@@ -652,7 +685,16 @@ def plot_route_network_by_vehicle(route_paths: list[dict[str, object]], active_c
     )
     for path in route_paths:
         color = VEHICLE_COLORS.get(path["vehicle_type"], "#64748b")
-        ax.plot(path["x"], path["y"], color=color, alpha=0.22, linewidth=1.3, zorder=2)
+        draw_soft_route(
+            ax,
+            path["x"],
+            path["y"],
+            color=color,
+            linewidth=1.35,
+            alpha=0.26,
+            zorder=2.4,
+            halo_width=0.0,
+        )
     legend_handles = [
         plt.Line2D([0], [0], color=color, lw=3, label=vehicle_type)
         for vehicle_type, color in VEHICLE_COLORS.items()
@@ -673,16 +715,28 @@ def plot_big_route_network(route_paths: list[dict[str, object]], active_customer
         active_customers,
         subtitle="Big-route families are separated into rigid, piggyback, promotion-like, and blocking.",
     )
+    for path in big_paths:
+        draw_soft_route(
+            ax,
+            path["x"],
+            path["y"],
+            color="#d8e0ea",
+            linewidth=1.3,
+            alpha=0.22,
+            zorder=2.2,
+            halo_width=0.0,
+        )
     for family in ["Rigid Big", "Piggyback Big", "Promotion-Like Big", "Blocking Big"]:
         family_paths = [path for path in big_paths if path["family"] == family]
         for path in family_paths:
-            ax.plot(
+            draw_soft_route(
+                ax,
                 path["x"],
                 path["y"],
                 color=FAMILY_COLORS.get(family, "#64748b"),
-                alpha=0.38 if family != "Blocking Big" else 0.72,
-                linewidth=1.5 if family != "Blocking Big" else 2.2,
-                zorder=3,
+                alpha=0.42 if family != "Blocking Big" else 0.8,
+                linewidth=1.55 if family != "Blocking Big" else 2.3,
+                zorder=3.3,
             )
     legend_handles = [
         plt.Line2D([0], [0], color=FAMILY_COLORS[family], lw=3, label=family)
@@ -704,10 +758,27 @@ def plot_top_cost_route_map(route_paths: list[dict[str, object]], active_custome
         subtitle="Top 18 costly routes are highlighted and labeled by route id.",
     )
     for path in route_paths:
-        ax.plot(path["x"], path["y"], color="#cbd5e1", alpha=0.12, linewidth=0.9, zorder=1)
+        draw_soft_route(
+            ax,
+            path["x"],
+            path["y"],
+            color="#d7e1ec",
+            linewidth=0.95,
+            alpha=0.12,
+            zorder=1.4,
+            halo_width=0.0,
+        )
     for path in top_paths:
         color = VEHICLE_COLORS.get(path["vehicle_type"], "#64748b")
-        ax.plot(path["x"], path["y"], color=color, alpha=0.78, linewidth=2.4, zorder=3)
+        draw_soft_route(
+            ax,
+            path["x"],
+            path["y"],
+            color=color,
+            linewidth=2.35,
+            alpha=0.9,
+            zorder=3.8,
+        )
         if len(path["x"]) >= 3:
             label_x = float(path["x"][1])
             label_y = float(path["y"][1])
@@ -746,7 +817,7 @@ def write_visual_summary(figures_dir: Path) -> None:
 
 def main() -> None:
     args = parse_args()
-    figures_dir = args.artifacts_root / "figures"
+    figures_dir = args.output_dir or (args.artifacts_root / "figures")
     figures_dir.mkdir(parents=True, exist_ok=True)
     set_plot_style()
     context = build_plot_context(args.artifacts_root, args.preprocess_root)

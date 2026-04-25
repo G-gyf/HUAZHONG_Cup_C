@@ -1,0 +1,163 @@
+# Question 2 Cost-First v2 Report
+
+## Run Summary
+- Best seed: 11
+- Seed count: 1
+- Particle count per seed: 1
+- Max generations: 2
+- Top route candidates: 8
+- Applied budget signature: seeds=11|particles=1|generations=2|top=8
+- Run started/finished: 2026-04-25T13:29:40+08:00 / 2026-04-25T13:30:02+08:00
+- Run record count: 1
+- Mutation attempts/accepted/best updates: 1/1/2
+- Service unit count: 178
+- Packing strategy: baseline
+- Cost-first improved: 1
+- Route count: 133
+- Used vehicle count: 133
+- Total cost: 90142.330
+- Startup cost: 53200.000
+- Energy cost: 29882.849
+- Carbon cost: 6463.338
+- Waiting cost: 447.187
+- Late cost: 148.956
+- Total late minutes: 178.748
+- Total fuel: 3666.121 L
+- Total electricity: 1209.556 kWh
+- Total carbon: 9943.596 kg
+- Reference total fuel/electricity/carbon: 4585.988 L / 6029.574 kWh / 14701.328 kg
+- Total distance: 15079.321 km
+- Split customers: 37
+- Mandatory split customers: 37
+- Mandatory split visits: 127
+- Normal customers: 51
+- Single-stop routes: 97
+- Two-stop routes: 29
+- Three-plus-stop routes: 7
+- Heavy big-only count: 47
+- Normal heavy big-only count: 17
+- Total heavy big-only count: 64
+- Heavy big-only capacity: 48
+- Big-vehicle inventory: 70
+- Big-vehicle reserve: 5
+- Fuel 3000 used count: 60
+- Fuel 3000 free count: 0
+- Single-single merge feasible pair count: 1602
+- Single-single merge inventory-blocked pair count: 1602
+- Final current single-pairs inventory-feasible count: 0
+- Final routes with flexible units on big: 31
+- Final flexible units on big routes: 46
+- Final piggyback/promotion-like/blocking big count: 18/6/7
+- Final blocking big flexible unit count: 16
+- Diagnostic unlock success count: 0
+- Diagnostic promotion success count: 0
+- Route-pool candidate count: 2854
+- Route-pool role counts: {"singleton": 566, "flex_small": 312, "cluster_flex_small": 55, "current": 133, "seed": 133, "promotion": 1494, "piggyback_big": 298, "policy_piggyback_q2": 298, "ev_flex_small_q2": 62, "residual_promotion": 311, "rigid_big": 120, "late_fuel_cluster_q2": 21}
+- Promotion-like candidate count: 1694
+- Positive-saving promotion-like candidate count: 1688
+- Piggyback-big candidate count: 300
+- Positive-saving piggyback-big candidate count: 283
+- Candidate-pool cap binding flag: 0
+- Flex-small candidate count by size: {"2": 295, "3": 47}
+- Selected flex-small count by size: {"2": 6, "3": 1}
+- Final solution source: pass2
+- Baseline route count: 136
+- Baseline single-stop route count: 105
+- Baseline total cost: 97205.554
+- Baseline fuel 3000 used/free: 60/0
+- Baseline routes with flexible units on big: 27
+- Baseline flexible units on big routes: 43
+- Baseline piggyback/promotion-like/blocking big count: 12/5/10
+- Baseline blocking big flexible unit count: 21
+- Baseline bad big-flexible route/unit count: 10/21
+- Baseline current single-pairs feasible/inventory-feasible: 1762/0
+- Global model status: ok
+- Global selected as final: 1
+- Global validation status: cost_first_improved
+- Global route-pool candidate count: 2854
+- Route-pool iterations configured: 2
+- Global pass1 route count: 133
+- Global pass1 single-stop route count: 98
+- Global pass1 selected singleton count: 98
+- Global pass1 selected promotion count: 7
+- Global pass1 selected promotion-like/piggyback count: 6/16
+- Global pass1 big-route count: 70
+- Global pass1 mixed/blocking big route count: 30/8
+- Global pass1 bad big-flexible route/unit count: 8/18
+- Global pass2 route count: 133
+- Global pass2 single-stop route count: 97
+- Global pass2 selected singleton count: 97
+- Global pass2 selected promotion count: 7
+- Global pass2 selected promotion-like/piggyback count: 6/18
+- Global pass2 routes with flexible units on big: 31
+- Global pass2 flexible units on big routes: 46
+- Global pass2 big-route count: 70
+- Global pass2 mixed/blocking big route count: 31/7
+- Global pass2 bad big-flexible route/unit count: 7/16
+- Global pass3 route count: None
+- Global pass3 single-stop route count: None
+- Global pass3 selected singleton/flexible-singleton/rigid-big-singleton count: None/None/None
+- Global pass3 selected flex-small count: None
+- Global pass3 selected promotion-like/piggyback count: None/None
+- Global pass3 bad big-flexible route count: None
+- Global pass3 big-route count: None
+- Global final total cost: 90142.32990705667
+- Global final route count: 133
+- Global final single-stop route count: 97
+- Global final current single-pairs feasible/inventory-feasible: 1602/0
+- Global final routes with flexible units on big: 31
+- Global final flexible units on big routes: 46
+- Global final piggyback/promotion-like/blocking big count: 18/6/7
+- Global fuel 3000 used/free: 60/0
+- Split/packing sensitivity executed/status: 0/not_run
+- Split/packing sensitivity total cost/route count: None/None
+- Reserve repair success count: 0
+- Batch merge success count: 0
+- Pre-merge single-stop route count: 105
+- Post-merge single-stop route count: 97
+- Late-positive stops: 14
+- Max late: 88.603 min
+- Latest return: 864.868 min
+- After-hours service count: 0
+- After-hours return count: 24
+- After-hours travel: 762.596 km
+- Vehicle type usage: {"ev_1250": 15, "ev_3000": 10, "fuel_1500": 48, "fuel_3000": 60}
+- Route merge successes: 1
+- Relocate successes: 2
+- Route type change successes: 4
+- Elapsed time: 22.39 s
+
+## Vehicle Dominance Diagnostics
+- Same startup cost for all vehicle types: 1
+- Energy model by power type only: 1
+- EV inventory binding: 1
+- Unused vehicle types: ["fuel_1250"]
+- Vehicle dominance notes: ["all_vehicle_types_share_same_startup_cost", "energy_and_carbon_model_only_distinguish_fuel_vs_ev", "fuel_1500_strictly_dominates_fuel_1250_under_current_cost_model", "ev_vehicle_inventory_is_binding_in_current_solution", "q2_policy_may_reallocate_ev_customers_without_increasing_total_ev_usage"]
+
+## Per-Seed Best
+
+## Cost-First MILP Phases
+- {"phase": "cost_first_total_cost", "stage": "cost_first", "status": "optimal", "fallback_used": 0, "selected_route_count": 133, "objective_value": 90280.03313366753, "pass_label": "pass1", "big_route_bound_mode": null}
+- {"phase": "cost_first_total_cost", "stage": "cost_first", "status": "optimal", "fallback_used": 0, "selected_route_count": 133, "objective_value": 90142.32990705664, "pass_label": "pass2", "big_route_bound_mode": null}
+- Seed 11: best cost 97205.554, routes 136, vehicles 136, split customers 37, single-stop routes 105, feasible particles 1, mutations attempted/accepted/best updates 1/1/2, late-positive stops 16, latest return 849.892, operators {"late_route_remove": 1}
+
+## Question 2 Policy Summary
+- Applied budget signature: seeds=11|particles=1|generations=2|top=8
+- Requested seed list / particles / generations / top candidates: [11] / 1 / 2 / 8
+- Run record count / mutation attempts / accepted / elapsed sec: 1 / 1 / 1 / 22.39
+- Output cache only stores arc lookup data; final solutions are recomputed each run.
+- Green-zone basis: attachment_geometry_radius_10km
+- Green-zone active customers used: 12
+- Mandatory-EV customers (all / active): 9 / 8
+- Fuel visits inside green zone before 16:00: 0
+- Fuel visits inside green zone after 16:00: 6
+- EV visits inside green zone: 17
+- Mandatory-EV customers served by non-EV: 0
+- Policy violation count / route ids: 0 / []
+- Q1 EV usage baseline / Q2 EV usage total: 25 / 25
+- Ordinary customers served by EV / must-use-EV customers served by EV only: 12 / 8
+
+## Q2 v2 Summary
+- EV usage by policy class: {"must_use_ev_customers_served_by_ev_only": 8, "fuel_after_16_customers_served_by_fuel": 4, "ordinary_customers_served_by_ev": 12}
+- Fuel-after-16 customers served by fuel: 4
+- Cost improvement vs Q2 baseline: 289.956180699417

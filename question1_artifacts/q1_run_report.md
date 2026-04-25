@@ -2,6 +2,14 @@
 
 ## Run Summary
 - Best seed: 11
+- Seed count: 1
+- Particle count per seed: 1
+- Max generations: 2
+- Top route candidates: 8
+- Applied budget signature: seeds=11|particles=1|generations=2|top=8
+- Run started/finished: 2026-04-25T13:27:34+08:00 / 2026-04-25T13:27:58+08:00
+- Run record count: 1
+- Mutation attempts/accepted/best updates: 1/1/2
 - Service unit count: 175
 - Packing strategy: baseline
 - Cost-first improved: 1
@@ -14,9 +22,10 @@
 - Waiting cost: 356.319
 - Late cost: 425.221
 - Total late minutes: 510.266
-- Total fuel: 4547.471 L
-- Total electricity: 5980.100 kWh
-- Total carbon: 14578.438 kg
+- Total fuel: 3334.631 L
+- Total electricity: 1596.357 kWh
+- Total carbon: 9293.080 kg
+- Reference total fuel/electricity/carbon: 4547.471 L / 5980.100 kWh / 14578.438 kg
 - Total distance: 14903.105 km
 - Split customers: 37
 - Mandatory split customers: 37
@@ -54,7 +63,7 @@
 - Final solution source: pass2
 - Baseline route count: 132
 - Baseline single-stop route count: 101
-- Baseline total cost: 92442.098
+- Baseline total cost: 92246.899
 - Baseline fuel 3000 used/free: 60/0
 - Baseline routes with flexible units on big: 27
 - Baseline flexible units on big routes: 44
@@ -115,12 +124,19 @@
 - Vehicle type usage: {"ev_1250": 15, "ev_3000": 10, "fuel_1500": 47, "fuel_3000": 60}
 - Route merge successes: 0
 - Relocate successes: 0
-- Route type change successes: 2
-- Elapsed time: 27.05 s
+- Route type change successes: 4
+- Elapsed time: 24.49 s
+
+## Vehicle Dominance Diagnostics
+- Same startup cost for all vehicle types: 1
+- Energy model by power type only: 1
+- EV inventory binding: 1
+- Unused vehicle types: ["fuel_1250"]
+- Vehicle dominance notes: ["all_vehicle_types_share_same_startup_cost", "energy_and_carbon_model_only_distinguish_fuel_vs_ev", "fuel_1500_strictly_dominates_fuel_1250_under_current_cost_model", "ev_vehicle_inventory_is_binding_in_current_solution", "q2_policy_may_reallocate_ev_customers_without_increasing_total_ev_usage"]
 
 ## Per-Seed Best
 
 ## Cost-First MILP Phases
-- {"phase": "cost_first_total_cost", "stage": "cost_first", "status": "optimal", "fallback_used": 0, "selected_route_count": 132, "objective_value": 87988.73644543935, "pass_label": "pass1", "big_route_bound_mode": null}
+- {"phase": "cost_first_total_cost", "stage": "cost_first", "status": "optimal", "fallback_used": 0, "selected_route_count": 132, "objective_value": 87988.73644543934, "pass_label": "pass1", "big_route_bound_mode": null}
 - {"phase": "cost_first_total_cost", "stage": "cost_first", "status": "optimal", "fallback_used": 0, "selected_route_count": 132, "objective_value": 87616.6097988012, "pass_label": "pass2", "big_route_bound_mode": null}
-- Seed 11: best cost 92442.098, routes 132, vehicles 132, split customers 37, single-stop routes 101, late-positive stops 20, latest return 866.100
+- Seed 11: best cost 92246.899, routes 132, vehicles 132, split customers 37, single-stop routes 101, feasible particles 1, mutations attempted/accepted/best updates 1/1/2, late-positive stops 18, latest return 866.100, operators {"late_route_remove": 1}

@@ -1,4 +1,4 @@
-# Question 1 Solver Report
+# Question 2 Solver Report
 
 ## Run Summary
 - Best seed: 11
@@ -6,6 +6,8 @@
 - Particle count per seed: 1
 - Max generations: 2
 - Top route candidates: 8
+- Applied budget signature: seeds=11|particles=1|generations=2|top=8
+- Run started/finished: 2026-04-25T13:28:36+08:00 / 2026-04-25T13:28:58+08:00
 - Run record count: 1
 - Mutation attempts/accepted/best updates: 1/1/1
 - Service unit count: 178
@@ -13,16 +15,17 @@
 - Cost-first improved: 1
 - Route count: 133
 - Used vehicle count: 133
-- Total cost: 108285.299
+- Total cost: 90432.286
 - Startup cost: 53200.000
-- Energy cost: 44722.325
-- Carbon cost: 9541.864
+- Energy cost: 29935.560
+- Carbon cost: 6475.617
 - Waiting cost: 468.423
 - Late cost: 352.687
 - Total late minutes: 423.224
-- Total fuel: 4579.176 L
-- Total electricity: 6021.216 kWh
-- Total carbon: 14679.791 kg
+- Total fuel: 3678.671 L
+- Total electricity: 1183.461 kWh
+- Total carbon: 9962.488 kg
+- Reference total fuel/electricity/carbon: 4579.176 L / 6021.216 kWh / 14679.791 kg
 - Total distance: 15026.978 km
 - Split customers: 37
 - Mandatory split customers: 37
@@ -60,7 +63,7 @@
 - Final solution source: pass2
 - Baseline route count: 134
 - Baseline single-stop route count: 103
-- Baseline total cost: 111728.606
+- Baseline total cost: 93741.595
 - Baseline fuel 3000 used/free: 60/0
 - Baseline routes with flexible units on big: 30
 - Baseline flexible units on big routes: 49
@@ -98,7 +101,7 @@
 - Global pass3 selected promotion-like/piggyback count: None/None
 - Global pass3 bad big-flexible route count: None
 - Global pass3 big-route count: None
-- Global final total cost: 108285.29872065687
+- Global final total cost: 90432.28608775609
 - Global final route count: 133
 - Global final single-stop route count: 99
 - Global final current single-pairs feasible/inventory-feasible: 1654/0
@@ -122,16 +125,27 @@
 - Route merge successes: 0
 - Relocate successes: 0
 - Route type change successes: 2
-- Elapsed time: 25.28 s
+- Elapsed time: 21.96 s
+
+## Vehicle Dominance Diagnostics
+- Same startup cost for all vehicle types: 1
+- Energy model by power type only: 1
+- EV inventory binding: 1
+- Unused vehicle types: ["fuel_1250"]
+- Vehicle dominance notes: ["all_vehicle_types_share_same_startup_cost", "energy_and_carbon_model_only_distinguish_fuel_vs_ev", "fuel_1500_strictly_dominates_fuel_1250_under_current_cost_model", "ev_vehicle_inventory_is_binding_in_current_solution", "q2_policy_may_reallocate_ev_customers_without_increasing_total_ev_usage"]
 
 ## Per-Seed Best
 
 ## Cost-First MILP Phases
 - {"phase": "cost_first_total_cost", "stage": "cost_first", "status": "optimal", "fallback_used": 0, "selected_route_count": 133, "objective_value": 90451.83021174933, "pass_label": "pass1", "big_route_bound_mode": null}
 - {"phase": "cost_first_total_cost", "stage": "cost_first", "status": "optimal", "fallback_used": 0, "selected_route_count": 133, "objective_value": 90432.28608775605, "pass_label": "pass2", "big_route_bound_mode": null}
-- Seed 11: best cost 111728.606, routes 134, vehicles 134, split customers 37, single-stop routes 103, feasible particles 1, mutations attempted/accepted/best updates 1/1/1, late-positive stops 20, latest return 837.359, operators {"late_route_remove": 1}
+- Seed 11: best cost 93741.595, routes 134, vehicles 134, split customers 37, single-stop routes 103, feasible particles 1, mutations attempted/accepted/best updates 1/1/1, late-positive stops 20, latest return 837.359, operators {"late_route_remove": 1}
 
 ## Question 2 Policy Summary
+- Applied budget signature: seeds=11|particles=1|generations=2|top=8
+- Requested seed list / particles / generations / top candidates: [11] / 1 / 2 / 8
+- Run record count / mutation attempts / accepted / elapsed sec: 1 / 1 / 1 / 21.96
+- Output cache only stores arc lookup data; final solutions are recomputed each run.
 - Green-zone basis: attachment_geometry_radius_10km
 - Green-zone active customers used: 12
 - Mandatory-EV customers (all / active): 9 / 8
@@ -140,3 +154,5 @@
 - EV visits inside green zone: 18
 - Mandatory-EV customers served by non-EV: 0
 - Policy violation count / route ids: 0 / []
+- Q1 EV usage baseline / Q2 EV usage total: 25 / 25
+- Ordinary customers served by EV / must-use-EV customers served by EV only: 14 / 8

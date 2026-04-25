@@ -7,6 +7,7 @@ import random
 import time
 from collections import Counter, defaultdict
 from dataclasses import dataclass
+from datetime import datetime
 from itertools import combinations, permutations
 from pathlib import Path
 from typing import Iterable
@@ -166,6 +167,8 @@ class AssignedRoute:
     total_late_min: float
     total_fuel_l: float
     total_electricity_kwh: float
+    reference_fuel_l: float
+    reference_electricity_kwh: float
     route_distance_km: float
     after_hours_travel_km: float
     after_hours_service_count: int
@@ -188,6 +191,9 @@ class SolutionEvaluation:
     total_fuel_l: float
     total_electricity_kwh: float
     total_carbon_kg: float
+    reference_total_fuel_l: float
+    reference_total_electricity_kwh: float
+    reference_total_carbon_kg: float
     total_distance_km: float
     route_count: int
     used_vehicle_count: int
@@ -1154,6 +1160,8 @@ class Question1Solver:
         total_late = 0.0
         total_fuel = 0.0
         total_electricity = 0.0
+        reference_total_fuel = 0.0
+        reference_total_electricity = 0.0
         route_distance = 0.0
         after_hours_travel_km = 0.0
         after_hours_service_count = 0
@@ -1202,8 +1210,12 @@ class Question1Solver:
             electricity = base_electric * load_multiplier
             total_wait += wait
             total_late += late
-            total_fuel += fuel
-            total_electricity += electricity
+            reference_total_fuel += fuel
+            reference_total_electricity += electricity
+            if vehicle.power_type == "fuel":
+                total_fuel += fuel
+            else:
+                total_electricity += electricity
             route_distance += self._distance_between(previous_node, unit.orig_cust_id)
             after_hours_travel_km += self._scalar_after_hours_distance(previous_node, unit.orig_cust_id, current_departure)
             if service_start > DAY_END_MIN + 1e-9:
@@ -1277,8 +1289,12 @@ class Question1Solver:
                 after_hours_electric_back,
             )[0]
         )
-        total_fuel += base_fuel_back
-        total_electricity += base_electric_back
+        reference_total_fuel += base_fuel_back
+        reference_total_electricity += base_electric_back
+        if vehicle.power_type == "fuel":
+            total_fuel += base_fuel_back
+        else:
+            total_electricity += base_electric_back
         route_distance += self._distance_between(previous_node, 0)
         after_hours_travel_km += self._scalar_after_hours_distance(previous_node, 0, current_departure)
         return_min = current_departure + travel_back
@@ -1313,6 +1329,8 @@ class Question1Solver:
             total_late_min=float(total_late),
             total_fuel_l=float(total_fuel),
             total_electricity_kwh=float(total_electricity),
+            reference_fuel_l=float(reference_total_fuel),
+            reference_electricity_kwh=float(reference_total_electricity),
             route_distance_km=float(route_distance),
             after_hours_travel_km=float(after_hours_travel_km),
             after_hours_service_count=after_hours_service_count,
@@ -1355,7 +1373,13 @@ class Question1Solver:
         total_startup_cost = float(sum(route.startup_cost for route in assigned_routes))
         total_fuel_l = float(sum(route.total_fuel_l for route in assigned_routes))
         total_electricity_kwh = float(sum(route.total_electricity_kwh for route in assigned_routes))
+        reference_total_fuel_l = float(sum(route.reference_fuel_l for route in assigned_routes))
+        reference_total_electricity_kwh = float(sum(route.reference_electricity_kwh for route in assigned_routes))
         total_carbon_kg = total_fuel_l * FUEL_CARBON_FACTOR + total_electricity_kwh * ELECTRICITY_CARBON_FACTOR
+        reference_total_carbon_kg = (
+            reference_total_fuel_l * FUEL_CARBON_FACTOR
+            + reference_total_electricity_kwh * ELECTRICITY_CARBON_FACTOR
+        )
         total_distance_km = float(sum(route.route_distance_km for route in assigned_routes))
         late_positive_stops = int(sum(route.late_positive_stop_count for route in assigned_routes))
         max_late_min = float(max((route.max_late_min for route in assigned_routes), default=0.0))
@@ -1392,6 +1416,9 @@ class Question1Solver:
             total_fuel_l=total_fuel_l,
             total_electricity_kwh=total_electricity_kwh,
             total_carbon_kg=total_carbon_kg,
+            reference_total_fuel_l=reference_total_fuel_l,
+            reference_total_electricity_kwh=reference_total_electricity_kwh,
+            reference_total_carbon_kg=reference_total_carbon_kg,
             total_distance_km=total_distance_km,
             route_count=len(assigned_routes),
             used_vehicle_count=len(assigned_routes),
@@ -1411,6 +1438,37 @@ class Question1Solver:
             vehicle_type_usage=dict(vehicle_type_usage),
             assigned_routes=assigned_routes,
         )
+
+    def _vehicle_dominance_diagnostics(self, solution_eval: SolutionEvaluation) -> dict[str, object]:
+        ev_vehicle_types = [vehicle.vehicle_type for vehicle in self.vehicles if vehicle.power_type == "ev"]
+        ev_inventory_binding = int(
+            all(
+                solution_eval.vehicle_type_usage.get(vehicle_type, 0) >= self.vehicle_by_name[vehicle_type].vehicle_count
+                for vehicle_type in ev_vehicle_types
+            )
+        )
+        unused_vehicle_types = sorted(
+            vehicle.vehicle_type
+            for vehicle in self.vehicles
+            if solution_eval.vehicle_type_usage.get(vehicle.vehicle_type, 0) == 0
+        )
+        notes: list[str] = []
+        if START_COST == 400.0:
+            notes.append("all_vehicle_types_share_same_startup_cost")
+        notes.append("energy_and_carbon_model_only_distinguish_fuel_vs_ev")
+        if "fuel_1250" in unused_vehicle_types and solution_eval.vehicle_type_usage.get("fuel_1500", 0) > 0:
+            notes.append("fuel_1500_strictly_dominates_fuel_1250_under_current_cost_model")
+        if ev_inventory_binding:
+            notes.append("ev_vehicle_inventory_is_binding_in_current_solution")
+        if solution_eval.vehicle_type_usage.get("ev_1250", 0) > 0 or solution_eval.vehicle_type_usage.get("ev_3000", 0) > 0:
+            notes.append("q2_policy_may_reallocate_ev_customers_without_increasing_total_ev_usage")
+        return {
+            "same_start_cost_all_vehicle_types": 1,
+            "energy_model_by_power_type_only": 1,
+            "ev_inventory_binding": ev_inventory_binding,
+            "unused_vehicle_types": unused_vehicle_types,
+            "vehicle_dominance_notes": notes,
+        }
 
     def _solution_rank_key(self, solution_eval: SolutionEvaluation) -> tuple[float, int, int, int, float, float]:
         structural_split_gap = abs(
@@ -3761,6 +3819,7 @@ class Question1Solver:
             return reference_eval is None or self._solution_rank_key(candidate_eval) < self._solution_rank_key(reference_eval)
 
         best_operator_stats = empty_operator_stats()
+        run_started_at = datetime.now().astimezone().isoformat(timespec="seconds")
         search_start = time.perf_counter()
 
         for seed in self.seed_list:
@@ -3944,6 +4003,7 @@ class Question1Solver:
                 cost_first_improved = True
 
         elapsed_sec = time.perf_counter() - search_start
+        run_finished_at = datetime.now().astimezone().isoformat(timespec="seconds")
         final_route_counts = self._route_counts(best_solution_routes)
         final_big_route_diagnostics = self._solution_big_route_diagnostics(best_solution_routes)
         final_bad_big_flexible_route_count = final_big_route_diagnostics["blocking_big_flexible_count"]
@@ -4029,12 +4089,20 @@ class Question1Solver:
         metadata = {
             "best_seed": best_seed,
             "elapsed_sec": elapsed_sec,
+            "run_started_at": run_started_at,
+            "run_finished_at": run_finished_at,
             "run_records": run_records,
             "seed_list": list(self.seed_list),
             "seed_count": len(self.seed_list),
             "particle_count": self.particle_count,
             "max_generations": self.max_generations,
             "top_route_candidates": self.top_route_candidates,
+            "applied_budget_signature": (
+                f"seeds={','.join(str(seed) for seed in self.seed_list)}|"
+                f"particles={self.particle_count}|"
+                f"generations={self.max_generations}|"
+                f"top={self.top_route_candidates}"
+            ),
             "run_record_count": len(run_records),
             "total_mutation_attempt_count": sum(int(item["mutation_attempt_count"]) for item in run_records),
             "total_accepted_mutation_count": sum(int(item["accepted_mutation_count"]) for item in run_records),
@@ -4245,6 +4313,8 @@ class Question1Solver:
                     "total_late_min": round(route.total_late_min, 6),
                     "fuel_l": round(route.total_fuel_l, 6),
                     "electricity_kwh": round(route.total_electricity_kwh, 6),
+                    "reference_fuel_l": round(route.reference_fuel_l, 6),
+                    "reference_electricity_kwh": round(route.reference_electricity_kwh, 6),
                     "route_distance_km": round(route.route_distance_km, 6),
                     "after_hours_travel_km": round(route.after_hours_travel_km, 6),
                     "after_hours_service_count": route.after_hours_service_count,
@@ -4343,6 +4413,7 @@ class Question1Solver:
         if stale_atom_path.exists():
             stale_atom_path.unlink()
 
+        dominance_diagnostics = self._vehicle_dominance_diagnostics(solution_eval)
         cost_summary = {
             "total_cost": solution_eval.total_cost,
             "startup_cost": solution_eval.total_startup_cost,
@@ -4354,6 +4425,9 @@ class Question1Solver:
             "total_fuel_l": solution_eval.total_fuel_l,
             "total_electricity_kwh": solution_eval.total_electricity_kwh,
             "total_carbon_kg": solution_eval.total_carbon_kg,
+            "reference_total_fuel_l": solution_eval.reference_total_fuel_l,
+            "reference_total_electricity_kwh": solution_eval.reference_total_electricity_kwh,
+            "reference_total_carbon_kg": solution_eval.reference_total_carbon_kg,
             "total_distance_km": solution_eval.total_distance_km,
             "route_count": solution_eval.route_count,
             "used_vehicle_count": solution_eval.used_vehicle_count,
@@ -4495,6 +4569,9 @@ class Question1Solver:
             "service_unit_count": metadata["service_unit_count"],
             "route_cache_size": metadata["route_cache_size"],
             "elapsed_sec": metadata["elapsed_sec"],
+            "run_started_at": metadata["run_started_at"],
+            "run_finished_at": metadata["run_finished_at"],
+            "applied_budget_signature": metadata["applied_budget_signature"],
             "packing_strategy": metadata["packing_strategy"],
             "route_pool_iteration_count": metadata["route_pool_iteration_count"],
             "cost_first_improved": metadata["cost_first_improved"],
@@ -4505,6 +4582,7 @@ class Question1Solver:
             "split_packing_sensitivity_reference_total_cost": metadata["split_packing_sensitivity_reference_total_cost"],
             "split_packing_sensitivity_reference_route_count": metadata["split_packing_sensitivity_reference_route_count"],
             "final_solution_source": metadata["final_solution_source"],
+            **dominance_diagnostics,
         }
         (self.output_root / "q1_cost_summary.json").write_text(json.dumps(cost_summary, indent=2), encoding="utf-8")
 
@@ -4517,6 +4595,8 @@ class Question1Solver:
             f"- Particle count per seed: {metadata['particle_count']}",
             f"- Max generations: {metadata['max_generations']}",
             f"- Top route candidates: {metadata['top_route_candidates']}",
+            f"- Applied budget signature: {metadata['applied_budget_signature']}",
+            f"- Run started/finished: {metadata['run_started_at']} / {metadata['run_finished_at']}",
             f"- Run record count: {metadata['run_record_count']}",
             f"- Mutation attempts/accepted/best updates: {metadata['total_mutation_attempt_count']}/"
             f"{metadata['total_accepted_mutation_count']}/{metadata['total_best_update_count']}",
@@ -4535,6 +4615,8 @@ class Question1Solver:
             f"- Total fuel: {solution_eval.total_fuel_l:.3f} L",
             f"- Total electricity: {solution_eval.total_electricity_kwh:.3f} kWh",
             f"- Total carbon: {solution_eval.total_carbon_kg:.3f} kg",
+            f"- Reference total fuel/electricity/carbon: {solution_eval.reference_total_fuel_l:.3f} L / "
+            f"{solution_eval.reference_total_electricity_kwh:.3f} kWh / {solution_eval.reference_total_carbon_kg:.3f} kg",
             f"- Total distance: {solution_eval.total_distance_km:.3f} km",
             f"- Split customers: {solution_eval.split_customer_count}",
             f"- Mandatory split customers: {solution_eval.mandatory_split_customer_count}",
@@ -4635,6 +4717,13 @@ class Question1Solver:
             f"- Relocate successes: {metadata['relocate_success_count']}",
             f"- Route type change successes: {metadata['route_type_change_success_count']}",
             f"- Elapsed time: {metadata['elapsed_sec']:.2f} s",
+            "",
+            "## Vehicle Dominance Diagnostics",
+            f"- Same startup cost for all vehicle types: {dominance_diagnostics['same_start_cost_all_vehicle_types']}",
+            f"- Energy model by power type only: {dominance_diagnostics['energy_model_by_power_type_only']}",
+            f"- EV inventory binding: {dominance_diagnostics['ev_inventory_binding']}",
+            f"- Unused vehicle types: {json.dumps(dominance_diagnostics['unused_vehicle_types'], ensure_ascii=False)}",
+            f"- Vehicle dominance notes: {json.dumps(dominance_diagnostics['vehicle_dominance_notes'], ensure_ascii=False)}",
             "",
             "## Per-Seed Best",
         ]

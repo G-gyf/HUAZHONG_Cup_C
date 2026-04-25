@@ -1,0 +1,38 @@
+{
+  "baseline_total_cost": 87616.6097988012,
+  "hybrid_total_cost": 86666.8103243667,
+  "baseline_route_count": 132,
+  "hybrid_route_count": 131,
+  "baseline_single_stop_route_count": 97,
+  "hybrid_single_stop_route_count": 98,
+  "baseline_late_positive_stops": 18,
+  "hybrid_late_positive_stops": 9,
+  "baseline_max_late_min": 99.00397146743023,
+  "hybrid_max_late_min": 24.944767310866155,
+  "baseline_vehicle_type_usage": {
+    "ev_1250": 15,
+    "ev_3000": 10,
+    "fuel_1500": 47,
+    "fuel_3000": 60
+  },
+  "hybrid_vehicle_type_usage": {
+    "ev_1250": 15,
+    "ev_3000": 10,
+    "fuel_1500": 46,
+    "fuel_3000": 60
+  },
+  "baseline_final_solution_source": "pass2",
+  "hybrid_final_solution_source": "hybrid_pass1",
+  "cost_best_total_cost": 86666.8103243667,
+  "cost_best_route_count": 131,
+  "cost_best_single_stop_route_count": 98,
+  "cost_best_late_positive_stops": 9,
+  "cost_best_max_late_min": 24.944767310866155,
+  "cost_best_final_solution_source": "hybrid_pass1",
+  "balanced_best_total_cost": 86666.81032436667,
+  "balanced_best_route_count": 131,
+  "balanced_best_single_stop_route_count": 98,
+  "balanced_best_late_positive_stops": 9,
+  "balanced_best_max_late_min": 24.944767310866155,
+  "balanced_best_final_solution_source": "hybrid_candidate"
+}

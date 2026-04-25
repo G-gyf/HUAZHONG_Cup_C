@@ -764,6 +764,8 @@ class Question2Solver(q1.Question1Solver):
         total_late = 0.0
         total_fuel = 0.0
         total_electricity = 0.0
+        reference_total_fuel = 0.0
+        reference_total_electricity = 0.0
         route_distance = 0.0
         after_hours_travel_km = 0.0
         after_hours_service_count = 0
@@ -813,8 +815,12 @@ class Question2Solver(q1.Question1Solver):
             electricity = base_electric * load_multiplier
             total_wait += wait
             total_late += late
-            total_fuel += fuel
-            total_electricity += electricity
+            reference_total_fuel += fuel
+            reference_total_electricity += electricity
+            if vehicle.power_type == "fuel":
+                total_fuel += fuel
+            else:
+                total_electricity += electricity
             route_distance += self._distance_between(previous_node, unit.orig_cust_id)
             after_hours_travel_km += self._scalar_after_hours_distance(previous_node, unit.orig_cust_id, current_departure)
             if service_start > q1.DAY_END_MIN + 1e-9:
@@ -901,10 +907,16 @@ class Question2Solver(q1.Question1Solver):
         after_hours_travel_km += self._scalar_after_hours_distance(previous_node, 0, current_departure)
         after_hours_return_flag = return_time > q1.DAY_END_MIN + 1e-9
 
-        total_fuel += base_fuel_back
-        total_electricity += base_electric_back
-        energy_cost = total_fuel * q1.FUEL_PRICE + total_electricity * q1.ELECTRICITY_PRICE
-        carbon_cost = (total_fuel * q1.FUEL_CARBON_FACTOR + total_electricity * q1.ELECTRICITY_CARBON_FACTOR) * q1.CARBON_COST
+        reference_total_fuel += base_fuel_back
+        reference_total_electricity += base_electric_back
+        if vehicle.power_type == "fuel":
+            total_fuel += base_fuel_back
+            energy_cost = total_fuel * q1.FUEL_PRICE
+            carbon_cost = total_fuel * q1.FUEL_CARBON_FACTOR * q1.CARBON_COST
+        else:
+            total_electricity += base_electric_back
+            energy_cost = total_electricity * q1.ELECTRICITY_PRICE
+            carbon_cost = total_electricity * q1.ELECTRICITY_CARBON_FACTOR * q1.CARBON_COST
         waiting_cost = total_wait * q1.WAIT_COST_PER_MIN
         late_cost = total_late * q1.LATE_COST_PER_MIN
         route_cost = q1.START_COST + energy_cost + carbon_cost + waiting_cost + late_cost
@@ -927,6 +939,8 @@ class Question2Solver(q1.Question1Solver):
             total_late_min=total_late,
             total_fuel_l=total_fuel,
             total_electricity_kwh=total_electricity,
+            reference_fuel_l=reference_total_fuel,
+            reference_electricity_kwh=reference_total_electricity,
             route_distance_km=route_distance,
             after_hours_travel_km=after_hours_travel_km,
             after_hours_service_count=after_hours_service_count,
@@ -1030,6 +1044,8 @@ class Question2Solver(q1.Question1Solver):
         route_pool_summary_df = self._read_optional_csv(q1_route_pool_summary_path)
         cost_summary = json.loads(q1_cost_summary_path.read_text(encoding="utf-8"))
         report_lines = q1_run_report_path.read_text(encoding="utf-8").splitlines()
+        if report_lines and report_lines[0].startswith("# "):
+            report_lines[0] = "# Question 2 Solver Report"
 
         policy_df = self._policy_customer_df()
         policy_customer_columns = [
@@ -1136,8 +1152,46 @@ class Question2Solver(q1.Question1Solver):
                 "ev_route_green_zone_visit_count": metadata["ev_route_green_zone_visit_count"],
                 "policy_violation_count": metadata["policy_violation_count"],
                 "policy_violation_route_ids": metadata["policy_violation_route_ids"],
+                "requested_seed_list": metadata["seed_list"],
+                "requested_particle_count": metadata["particle_count"],
+                "requested_max_generations": metadata["max_generations"],
+                "requested_top_route_candidates": metadata["top_route_candidates"],
             }
         )
+
+        q1_baseline_summary_path = self.workspace / "question1_artifacts" / "q1_cost_summary.json"
+        if q1_baseline_summary_path.exists():
+            q1_baseline_summary = json.loads(q1_baseline_summary_path.read_text(encoding="utf-8"))
+            q1_ev_usage_baseline = int(
+                sum(
+                    int(count)
+                    for vehicle_type, count in q1_baseline_summary.get("vehicle_type_usage", {}).items()
+                    if str(vehicle_type).startswith("ev")
+                )
+            )
+            cost_summary["q1_ev_usage_baseline"] = q1_ev_usage_baseline
+        q2_ev_usage_total = int(
+            sum(
+                int(count)
+                for vehicle_type, count in solution_eval.vehicle_type_usage.items()
+                if str(vehicle_type).startswith("ev")
+            )
+        )
+        cost_summary["q2_ev_usage_total"] = q2_ev_usage_total
+        if not customer_aggregate_df.empty:
+            cost_summary["ordinary_customers_served_by_ev"] = int(
+                (
+                    (customer_aggregate_df["must_use_ev_under_policy"] == 0)
+                    & (customer_aggregate_df["served_by_ev"] == 1)
+                ).sum()
+            )
+            cost_summary["must_use_ev_customers_served_by_ev_only"] = int(
+                (
+                    (customer_aggregate_df["must_use_ev_under_policy"] == 1)
+                    & (customer_aggregate_df["served_by_ev"] == 1)
+                    & (customer_aggregate_df["served_by_fuel"] == 0)
+                ).sum()
+            )
 
         ev_policy_summary_record = (
             self.ev_policy_summary_df.iloc[0].to_dict()
@@ -1167,6 +1221,13 @@ class Question2Solver(q1.Question1Solver):
             [
                 "",
                 "## Question 2 Policy Summary",
+                f"- Applied budget signature: {metadata['applied_budget_signature']}",
+                f"- Requested seed list / particles / generations / top candidates: "
+                f"{metadata['seed_list']} / {metadata['particle_count']} / {metadata['max_generations']} / {metadata['top_route_candidates']}",
+                f"- Run record count / mutation attempts / accepted / elapsed sec: "
+                f"{metadata['run_record_count']} / {metadata['total_mutation_attempt_count']} / "
+                f"{metadata['total_accepted_mutation_count']} / {metadata['elapsed_sec']:.2f}",
+                "- Output cache only stores arc lookup data; final solutions are recomputed each run.",
                 f"- Green-zone basis: {metadata['green_zone_basis']}",
                 f"- Green-zone active customers used: {metadata['green_zone_customer_count_used']}",
                 f"- Mandatory-EV customers (all / active): {metadata['mandatory_ev_customer_count']} / {metadata['mandatory_ev_active_customer_count']}",
@@ -1175,6 +1236,9 @@ class Question2Solver(q1.Question1Solver):
                 f"- EV visits inside green zone: {metadata['ev_route_green_zone_visit_count']}",
                 f"- Mandatory-EV customers served by non-EV: {metadata['mandatory_ev_served_by_non_ev_count']}",
                 f"- Policy violation count / route ids: {metadata['policy_violation_count']} / {metadata['policy_violation_route_ids']}",
+                f"- Q1 EV usage baseline / Q2 EV usage total: {cost_summary.get('q1_ev_usage_baseline')} / {cost_summary['q2_ev_usage_total']}",
+                f"- Ordinary customers served by EV / must-use-EV customers served by EV only: "
+                f"{cost_summary.get('ordinary_customers_served_by_ev')} / {cost_summary.get('must_use_ev_customers_served_by_ev_only')}",
             ]
         )
 
@@ -1248,6 +1312,14 @@ def main() -> None:
                 "policy_violation_count": metadata["policy_violation_count"],
                 "mandatory_ev_served_by_non_ev_count": metadata["mandatory_ev_served_by_non_ev_count"],
                 "green_zone_customer_count_used": metadata["green_zone_customer_count_used"],
+                "seed_count": metadata["seed_count"],
+                "particle_count": metadata["particle_count"],
+                "max_generations": metadata["max_generations"],
+                "run_record_count": metadata["run_record_count"],
+                "total_mutation_attempt_count": metadata["total_mutation_attempt_count"],
+                "total_accepted_mutation_count": metadata["total_accepted_mutation_count"],
+                "elapsed_sec": metadata["elapsed_sec"],
+                "applied_budget_signature": metadata["applied_budget_signature"],
                 "output_root": str(args.output_root),
             },
             indent=2,

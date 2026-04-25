@@ -6,9 +6,12 @@
   "waiting_cost": 356.3191575875486,
   "late_cost": 425.22146351046456,
   "total_late_min": 510.26575621255745,
-  "total_fuel_l": 4547.470582819961,
-  "total_electricity_kwh": 5980.100173797177,
-  "total_carbon_kg": 14578.43776151483,
+  "total_fuel_l": 3334.6309151422442,
+  "total_electricity_kwh": 1596.3572873639541,
+  "total_carbon_kg": 9293.079941836637,
+  "reference_total_fuel_l": 4547.470582819961,
+  "reference_total_electricity_kwh": 5980.100173797177,
+  "reference_total_carbon_kg": 14578.43776151483,
   "total_distance_km": 14903.105113267899,
   "route_count": 132,
   "used_vehicle_count": 132,
@@ -67,7 +70,7 @@
   },
   "baseline_route_count": 132,
   "baseline_single_stop_route_count": 101,
-  "baseline_total_cost": 92442.09827628093,
+  "baseline_total_cost": 92246.89862885905,
   "baseline_fuel_3000_used_count": 60,
   "baseline_fuel_3000_free_count": 0,
   "baseline_routes_with_flexible_units_on_big": 27,
@@ -88,7 +91,7 @@
       "status": "optimal",
       "fallback_used": 0,
       "selected_route_count": 132,
-      "objective_value": 87988.73644543935,
+      "objective_value": 87988.73644543934,
       "pass_label": "pass1",
       "big_route_bound_mode": null
     },
@@ -179,11 +182,44 @@
   },
   "route_merge_success_count": 0,
   "relocate_success_count": 0,
-  "route_type_change_success_count": 2,
+  "route_type_change_success_count": 4,
   "best_seed": 11,
+  "seed_list": [
+    11
+  ],
+  "seed_count": 1,
+  "particle_count": 1,
+  "max_generations": 2,
+  "top_route_candidates": 8,
+  "run_record_count": 1,
+  "total_mutation_attempt_count": 1,
+  "total_accepted_mutation_count": 1,
+  "total_best_update_count": 2,
+  "run_records": [
+    {
+      "seed": 11,
+      "best_cost": 92246.89862885905,
+      "route_count": 132,
+      "used_vehicle_count": 132,
+      "split_customer_count": 37,
+      "single_stop_route_count": 101,
+      "late_positive_stops": 18,
+      "latest_return_min": 866.1,
+      "initial_feasible_particle_count": 1,
+      "mutation_attempt_count": 1,
+      "accepted_mutation_count": 1,
+      "best_update_count": 2,
+      "operator_usage": {
+        "late_route_remove": 1
+      }
+    }
+  ],
   "service_unit_count": 175,
-  "route_cache_size": 68663,
-  "elapsed_sec": 27.04649629999767,
+  "route_cache_size": 70456,
+  "elapsed_sec": 24.492391100007808,
+  "run_started_at": "2026-04-25T13:27:34+08:00",
+  "run_finished_at": "2026-04-25T13:27:58+08:00",
+  "applied_budget_signature": "seeds=11|particles=1|generations=2|top=8",
   "packing_strategy": "baseline",
   "route_pool_iteration_count": 2,
   "cost_first_improved": 1,
@@ -193,5 +229,18 @@
   "split_packing_sensitivity_route_count": null,
   "split_packing_sensitivity_reference_total_cost": null,
   "split_packing_sensitivity_reference_route_count": null,
-  "final_solution_source": "pass2"
+  "final_solution_source": "pass2",
+  "same_start_cost_all_vehicle_types": 1,
+  "energy_model_by_power_type_only": 1,
+  "ev_inventory_binding": 1,
+  "unused_vehicle_types": [
+    "fuel_1250"
+  ],
+  "vehicle_dominance_notes": [
+    "all_vehicle_types_share_same_startup_cost",
+    "energy_and_carbon_model_only_distinguish_fuel_vs_ev",
+    "fuel_1500_strictly_dominates_fuel_1250_under_current_cost_model",
+    "ev_vehicle_inventory_is_binding_in_current_solution",
+    "q2_policy_may_reallocate_ev_customers_without_increasing_total_ev_usage"
+  ]
 }

@@ -1,3 +1,0 @@
-﻿generation,particle_id,source_mode,operator_name,destroy_ratio,construction_temperature,candidate_total_cost,candidate_route_count,candidate_single_stop_route_count,candidate_label,accepted_current,accepted_pbest,accepted_gbest
-0,0,construct,construct,0.12,1.0,88183.287684,132.0,95.0,pass2,1,1,0
-1,0,personal_best,random_remove,0.11622,0.9836,,,,,0,0,0
